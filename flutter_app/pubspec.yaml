@@ -1,0 +1,120 @@
+name: bananafarm
+description: "Blender-optimized render farms on dedicated RTX 90-Series GPUs."
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # UI & Material Design
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.1.0
+
+  # State Management
+  riverpod: ^2.4.0
+  flutter_riverpod: ^2.4.0
+  riverpod_annotation: ^2.3.0
+
+  # HTTP & Networking
+  http: ^1.1.0
+  dio: ^5.3.0
+  mime: ^1.0.4
+
+  # Local Storage
+  shared_preferences: ^2.2.0
+  sqflite: ^2.3.0
+  sqflite_common_ffi: ^2.3.0
+  path_provider: ^2.1.0
+
+  # Date & Time
+  intl: ^0.19.0
+
+  # Utilities
+  uuid: ^3.0.7
+  # Pure Dart (no native plugin) — used for upload integrity checksums.
+  crypto: ^3.0.3
+  url_launcher: ^6.1.0
+  logging: ^1.2.0
+  flutter_svg: ^2.2.3
+  file_picker: ^10.3.7
+  desktop_drop: ^0.7.0
+  cross_file: ^0.3.5+1
+  
+  # Desktop Integration
+  tray_manager: ^0.2.0
+  window_manager: ^0.3.7
+  # Replaced local_notifier, which implemented macOS with NSUserNotification —
+  # deprecated in macOS 11 and no longer delivering on 14. Windows is a second
+  # explicit dependency; the main package does not include it.
+  flutter_local_notifications: ^22.3.1
+  flutter_local_notifications_windows: ^3.1.1
+  
+  image: ^4.1.7
+  path: ^1.9.1
+  characters: ^1.3.0
+  lottie: ^3.1.2
+  package_info_plus: ^9.0.0
+  flutter_super_resolution: ^1.0.5
+  onnxruntime: ^1.4.1
+  archive: ^3.4.10
+  device_info_plus: ^12.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+  # Used by test/ai_lab_integration_test.dart to redirect
+  # getApplicationSupportDirectory() into a throwaway dir.
+  path_provider_platform_interface: ^2.1.0
+  plugin_platform_interface: ^2.1.0
+
+  # Code Generation
+  build_runner: ^2.4.13
+  riverpod_generator: ^2.3.0
+  flutter_launcher_icons: ^0.13.1
+  
+  # MSIX Installer (Windows)
+  msix: ^3.16.7
+  
+  # Linux Package Builder
+  flutter_distributor: ^0.6.0
+
+flutter_icons:
+  image_path: "assets/icon/icon.png"
+  windows:
+    generate: true
+    image_path: "assets/icon/icon.png"
+  macos:
+    generate: true
+    image_path: "assets/icon/icon.png"
+
+msix_config:
+  display_name: Banana Farm
+  publisher_display_name: 1.0.0  |  Day Dream
+  identity_name: com.daydream.bananafarm
+  msix_version: 1.0.0.0
+  logo_path: assets/icon/icon.png
+  capabilities: 'internetClient,privateNetworkClientServer'
+  background_color: '#fea900'
+
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/icon/
+    - assets/animations/
+    - assets/bin/lin/
+    - assets/bin/mac/
+    - assets/bin/win/
+    - assets/data/
+    - assets/addon/
+
+
