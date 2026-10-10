@@ -111,7 +111,6 @@ flutter:
     - assets/images/
     - assets/icon/
     - assets/animations/
-    - assets/bin/lin/
     - assets/bin/mac/
     - assets/bin/win/
     - assets/data/

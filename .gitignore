@@ -1,0 +1,44 @@
+# Repo-wide ignores. flutter_app/ and docker-image/ have their own .gitignore
+# files for toolchain-specific output.
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+config.local.*
+
+# Python (render container sources)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# Blender autosaves and backups
+*.blend1
+*.blend2
+
+# Claude Code local state
+.claude/

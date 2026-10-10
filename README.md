@@ -60,13 +60,12 @@ per-job bearer token instead.
 **macOS** and **Windows**.
 
 A `linux/` target is scaffolded — DEB and AppImage scripts, a `.desktop` file —
-but it is not shippable: `flutter_app/assets/bin/lin/` has no `7zz` binary, so
-project extraction fails. Treat Linux as unsupported for now.
+but it is not shippable: no Linux 7-Zip binary is bundled, so project extraction
+fails. Linux is unsupported.
 
 ## Getting started
 
-The full walkthrough is the site's `/docs` page
-([source](website/src/pages/Docs.tsx)). The short version:
+The full walkthrough is the `/docs` page on the Bananafarm website. The short version:
 
 1. Install the app, open the **Home** tab and click **Configure Addon**. Pick your
    Blender version — the newest installed one is already selected — and click
@@ -93,13 +92,43 @@ The full walkthrough is the site's `/docs` page
 
 ## Repository layout
 
+```
+Bananafarm/
+├── flutter_app/              Desktop app (Flutter)
+│   ├── lib/
+│   │   ├── constants/        App-wide constants, incl. the render image tag
+│   │   ├── models/           Jobs, GPU offers, providers, errors
+│   │   ├── providers/        Riverpod state
+│   │   ├── screens/          Dashboard, job submission/detail, settings
+│   │   ├── services/         Job queue, local storage, add-on install, …
+│   │   │   └── providers/    Vast.ai and RunPod API clients
+│   │   ├── theme/ utils/ widgets/
+│   │   └── main.dart
+│   ├── assets/
+│   │   ├── addon/            The Blender add-on (bananafarm.py)
+│   │   ├── bin/              Bundled 7-Zip (mac/7zz, win/7za.exe)
+│   │   ├── data/             GPU and model catalogs (JSON)
+│   │   └── icon/ images/ animations/
+│   ├── test/                 Unit and fixture-gated integration tests
+│   ├── macos/ windows/ linux/  Platform runners and packaging
+│   ├── scripts/              Icon, installer-image and Linux build scripts
+│   └── docker/               Dockerfile for a Linux build environment
+├── docker-image/             Render container image
+│   ├── Dockerfile
+│   ├── entrypoint.sh         Downloads the requested Blender, starts the API
+│   ├── requirements.txt
+│   └── src/                  FastAPI app, job pipeline, render executor
+├── logo.jpg
+└── LICENSE
+```
+
 | Path | What it is |
 | --- | --- |
-| [`flutter_app/`](flutter_app/) | The desktop app (Flutter). Also ships the add-on as a bundled asset |
+| [`flutter_app/`](flutter_app/) | The desktop app. Also ships the add-on as a bundled asset |
 | [`flutter_app/assets/addon/bananafarm.py`](flutter_app/assets/addon/bananafarm.py) | The Blender add-on, a single file |
-| [`website/`](website/) | Marketing site and docs (React + Vite + Tailwind v4) |
+| [`flutter_app/lib/services/providers/`](flutter_app/lib/services/providers/) | GPU provider clients — the authoritative reference for how each provider API is called |
+| [`flutter_app/windows/`](flutter_app/windows/) | Windows runner plus installer notes ([`BUILD_INSTALLER.md`](flutter_app/windows/BUILD_INSTALLER.md), [`BUILD_INSTALLER_MSIX.md`](flutter_app/windows/BUILD_INSTALLER_MSIX.md)) and the Inno Setup script |
 | [`docker-image/`](docker-image/) | Source for the render container image |
-| [`PROVIDER_API_REFERENCE.md`](PROVIDER_API_REFERENCE.md) | Archived notes on the three provider REST APIs. Documentation, not a spec — the implementation in `lib/services/providers/` is authoritative |
 
 ## Building from source
 
@@ -109,49 +138,25 @@ The full walkthrough is the site's `/docs` page
 | --- | --- |
 | Flutter | ≥ 3.35 |
 | Dart | ^3.9.2 |
-| Node | ≥ 20.19 (Vite 7) |
+| Docker | to build the render image |
 | Blender | 4.0+ (to use the add-on) |
 | Xcode + CocoaPods | for macOS builds |
 | Visual Studio + Inno Setup 6 | for Windows builds |
 
 ### Desktop app
 
-> [!IMPORTANT]
-> **A fresh clone will not build yet.** `.gitignore` excludes `flutter_app/assets/*`
-> and re-includes only `data/` and `addon/`, but `pubspec.yaml` declares eight
-> asset directories. The icon, splash image, loading animation and the bundled
-> 7-Zip binary are all missing from a clone and have to be restored first.
+Every asset the app needs is committed under `flutter_app/assets/`, including the
+bundled 7-Zip binaries for macOS (`bin/mac/7zz`) and Windows (`bin/win/7za.exe`),
+so a fresh clone builds as-is.
+
+The bundled `7zz` is an arm64 build, so macOS packing works on Apple Silicon
+only. Intel Macs need a universal or x86_64 `7zz` in its place.
 
 ```bash
 cd flutter_app
-
-# 1. Create the declared asset directories. Flutter skips empty ones, so this
-#    alone is enough to get a build; the steps below restore what they held.
-mkdir -p assets/{icon,images,animations,bin/mac,bin/win,bin/lin}
-
-# 2. Bundled 7-Zip, used to zip projects and unpack downloads (macOS)
-brew install sevenzip
-cp "$(brew --prefix sevenzip)/bin/7zz" assets/bin/mac/7zz
-chmod +x assets/bin/mac/7zz
-
-# 3. Icon and splash, regenerated from the images at the repo root.
-#    Note Cover.jpg is an outdated screenshot — it still shows a removed tab
-#    and the old credits UI — so this gets you building, not a correct splash.
-sips -s format png ../logo.jpg  --out assets/icon/icon.png
-sips -s format png ../Cover.jpg --out assets/images/splash_screen.png
-
-# 4. Build
 flutter pub get
-flutter run -d macos
+flutter run -d macos     # or: flutter run -d windows
 ```
-
-Two gaps this does not close. `assets/animations/loading.json` is a Lottie file
-that exists in no form in the repo — the build succeeds without it, but the
-splash screen's spinner will render an error box until a maintainer supplies it.
-And `assets/bin/win/7za.exe` is required at runtime by
-[`addon_provider.dart`](flutter_app/lib/providers/addon_provider.dart) and is
-absent, so a Windows build cannot zip projects until you place a 7-Zip
-executable there yourself.
 
 `flutter test` runs the suite. Several tests are integration tests that skip
 themselves unless fixture archives are present, so a plain run is safe and needs
@@ -160,18 +165,6 @@ no API keys.
 `build_runner`, `riverpod_generator` and `riverpod_annotation` are declared in
 `pubspec.yaml` but nothing uses them — there are no `.g.dart` files and no
 codegen step to run.
-
-### Website
-
-```bash
-cd website
-cp .env.example .env     # EmailJS credentials for the contact form
-npm install
-npm run dev              # or: npm run build
-```
-
-The `VITE_*` values are **not secrets** — Vite inlines them into the client
-bundle at build time. `.env.example` explains what actually protects them.
 
 ### Render image
 
@@ -216,13 +209,13 @@ yet, so please describe how you tested a change.
 
 ## Third-party components
 
-- **[7-Zip](https://www.7-zip.org/)** — LGPL-2.1-or-later, bundled as a binary
-  (`7zz`) and used to pack and unpack projects.
+- **[7-Zip](https://www.7-zip.org/)** — LGPL-2.1-or-later, bundled as binaries
+  (`7zz` on macOS, `7za.exe` on Windows) and used to pack and unpack projects.
 - **[Blender](https://www.blender.org/)** — GPL-2.0-or-later. Downloaded at
   container start, not redistributed here. The add-on uses Blender's `bpy` API.
 - **[Urbanist](https://fonts.google.com/specimen/Urbanist)** and
   **[Manrope](https://fonts.google.com/specimen/Manrope)** — SIL Open Font License
-  1.1, used by the website.
+  1.1, loaded by the desktop app through `google_fonts`.
 
 ## License
 
