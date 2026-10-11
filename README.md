@@ -94,7 +94,7 @@ The full walkthrough is the `/docs` page on the Bananafarm website. The short ve
 
 ```
 Bananafarm/
-├── flutter_app/              Desktop app (Flutter)
+├── flutter-app/              Desktop app (Flutter)
 │   ├── lib/
 │   │   ├── constants/        App-wide constants, incl. the render image tag
 │   │   ├── models/           Jobs, GPU offers, providers, errors
@@ -111,7 +111,7 @@ Bananafarm/
 │   │   └── icon/ images/ animations/
 │   ├── test/                 Unit and fixture-gated integration tests
 │   ├── macos/ windows/ linux/  Platform runners and packaging
-│   ├── scripts/              Icon, installer-image and Linux build scripts
+│   ├── scripts/              Icon, installer-image, DMG and Linux build scripts
 │   └── docker/               Dockerfile for a Linux build environment
 ├── docker-image/             Render container image
 │   ├── Dockerfile
@@ -124,10 +124,10 @@ Bananafarm/
 
 | Path | What it is |
 | --- | --- |
-| [`flutter_app/`](flutter_app/) | The desktop app. Also ships the add-on as a bundled asset |
-| [`flutter_app/assets/addon/bananafarm.py`](flutter_app/assets/addon/bananafarm.py) | The Blender add-on, a single file |
-| [`flutter_app/lib/services/providers/`](flutter_app/lib/services/providers/) | GPU provider clients — the authoritative reference for how each provider API is called |
-| [`flutter_app/windows/`](flutter_app/windows/) | Windows runner plus installer notes ([`BUILD_INSTALLER.md`](flutter_app/windows/BUILD_INSTALLER.md), [`BUILD_INSTALLER_MSIX.md`](flutter_app/windows/BUILD_INSTALLER_MSIX.md)) and the Inno Setup script |
+| [`flutter-app/`](flutter-app/) | The desktop app. Also ships the add-on as a bundled asset |
+| [`flutter-app/assets/addon/bananafarm.py`](flutter-app/assets/addon/bananafarm.py) | The Blender add-on, a single file |
+| [`flutter-app/lib/services/providers/`](flutter-app/lib/services/providers/) | GPU provider clients — the authoritative reference for how each provider API is called |
+| [`flutter-app/windows/`](flutter-app/windows/) | Windows runner plus installer notes ([`BUILD_INSTALLER.md`](flutter-app/windows/BUILD_INSTALLER.md), [`BUILD_INSTALLER_MSIX.md`](flutter-app/windows/BUILD_INSTALLER_MSIX.md)) and the Inno Setup script |
 | [`docker-image/`](docker-image/) | Source for the render container image |
 
 ## Building from source
@@ -145,7 +145,7 @@ Bananafarm/
 
 ### Desktop app
 
-Every asset the app needs is committed under `flutter_app/assets/`, including the
+Every asset the app needs is committed under `flutter-app/assets/`, including the
 bundled 7-Zip binaries for macOS (`bin/mac/7zz`) and Windows (`bin/win/7za.exe`),
 so a fresh clone builds as-is.
 
@@ -153,10 +153,23 @@ The bundled `7zz` is an arm64 build, so macOS packing works on Apple Silicon
 only. Intel Macs need a universal or x86_64 `7zz` in its place.
 
 ```bash
-cd flutter_app
+cd flutter-app
 flutter pub get
 flutter run -d macos     # or: flutter run -d windows
 ```
+
+#### macOS installer (DMG)
+
+```bash
+brew install create-dmg                 # once
+./flutter-app/scripts/macos/build_dmg.sh  # add --clean for a clean build
+```
+
+This builds the release app and writes
+`flutter-app/build/macos/dmg/BananaFarm-<version>-<arch>.dmg`, a
+drag-to-Applications installer. The app keeps the signature Xcode gives it
+during the build (Apple Development) and is not notarized. On other Macs it must
+be opened with right-click → **Open** the first time.
 
 `flutter test` runs the suite. Several tests are integration tests that skip
 themselves unless fixture archives are present, so a plain run is safe and needs
@@ -180,7 +193,7 @@ by tag, so a node can serve a stale build under the tag you asked for — the st
 is what makes that visible.
 
 The image the app currently rents is `docker.io/subinkx/bananafarm-render:2.0.0`,
-set in [`app_constants.dart`](flutter_app/lib/constants/app_constants.dart).
+set in [`app_constants.dart`](flutter-app/lib/constants/app_constants.dart).
 Change that constant to point at your own build.
 
 ## The render container
@@ -217,8 +230,12 @@ yet, so please describe how you tested a change.
   **[Manrope](https://fonts.google.com/specimen/Manrope)** — SIL Open Font License
   1.1, loaded by the desktop app through `google_fonts`.
 
+## Credits
+
+Made by [day-dream](https://www.day-dream.studio), led by
+[Subin Krishna](http://instagram.com/5x00.art), in collaboration with
+[Rabah Ahmed](https://github.com/Silvie3D).
+
 ## License
 
 [GPL-3.0-or-later](LICENSE).
-
-Built by [day-dream](https://www.day-dream.studio).
