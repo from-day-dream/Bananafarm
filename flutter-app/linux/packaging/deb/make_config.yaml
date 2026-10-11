@@ -1,0 +1,13 @@
+display_name: Banana Farm
+maintainer: Day Dream <support@daydream.com>
+package_name: bananafarm
+executable_name: bananafarm
+description: Blender-optimized render farms on dedicated RTX 90-Series GPUs
+homepage: https://bananafarm.daydream.com
+icon: linux/bananafarm.png
+section: graphics
+priority: optional
+depends:
+  - libgtk-3-0
+  - libblkid1
+  - liblzma5

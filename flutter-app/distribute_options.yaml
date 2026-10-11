@@ -1,0 +1,52 @@
+output: build/linux/packages
+releases:
+  - name: default
+    jobs:
+      # DEB Package (Debian/Ubuntu)
+      - name: deb
+        package:
+          platform: linux
+          target: deb
+          build_args:
+            target-platform: linux-x64
+            build-mode: release
+        post_packaging:
+          - appimagetool:
+              enabled: false
+
+      # AppImage Package (Universal Linux)
+      - name: appimage
+        package:
+          platform: linux
+          target: appimage
+          build_args:
+            target-platform: linux-x64
+            build-mode: release
+        post_packaging:
+          - appimagetool:
+              enabled: true
+
+# Package metadata
+packaging:
+  linux:
+    appimage:
+      name: BananaFarm
+      output_basename: bananafarm
+      desktop_file: linux/bananafarm.desktop
+      icon: assets/icon/icon.png
+      
+    deb:
+      name: bananafarm
+      maintainer: Day Dream <support@daydream.com>
+      homepage: https://bananafarm.daydream.com
+      description: |
+        Banana Farm - Blender Render Farm Client
+        
+        Blender-optimized render farms on dedicated RTX 90-Series GPUs.
+        Professional rendering service with deep Blender integration.
+      section: graphics
+      priority: optional
+      depends:
+        - libgtk-3-0
+        - libblkid1
+        - liblzma5
