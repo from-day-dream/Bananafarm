@@ -26,6 +26,34 @@ class JobSubmissionScreen extends ConsumerStatefulWidget {
 class _JobSubmissionScreenState extends ConsumerState<JobSubmissionScreen> {
   bool _isLoading = false;
 
+  /// Job-name field controllers, one per draft card, keyed by draft id.
+  final Map<String, TextEditingController> _nameControllers = {};
+
+  @override
+  void dispose() {
+    for (final controller in _nameControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  TextEditingController _nameController(DraftJob job) =>
+      _nameControllers.putIfAbsent(
+          job.id, () => TextEditingController(text: job.displayName));
+
+  /// Persist the typed name. An empty field reverts to the saved name.
+  Future<void> _saveJobName(DraftJob job) async {
+    final controller = _nameControllers[job.id];
+    if (controller == null) return;
+    if (controller.text.trim().isEmpty) {
+      controller.text = job.displayName;
+      return;
+    }
+    await ref
+        .read(draftJobsProvider.notifier)
+        .renameJob(job.id, controller.text);
+  }
+
   @override
   Widget build(BuildContext context) {
     final allDraftJobs = ref.watch(draftJobsProvider);
@@ -160,6 +188,9 @@ class _JobSubmissionScreenState extends ConsumerState<JobSubmissionScreen> {
               onPressed: _isLoading || job.selectedGpu == null
                   ? null
                   : () async {
+                      // Clicking the button doesn't always take focus from
+                      // the name field, so save whatever was typed first.
+                      await _saveJobName(job);
                       final activeCount =
                           ref.read(activeJobsProvider).length;
                       final maxConcurrent =
@@ -247,6 +278,8 @@ class _JobSubmissionScreenState extends ConsumerState<JobSubmissionScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _buildJobNameField(context, job),
+          const Divider(height: 24),
           _buildDetailRow(context, 'Engine', job.engine),
           const Divider(height: 16),
           _buildDetailRow(context, 'File', job.originalFilename),
@@ -261,6 +294,27 @@ class _JobSubmissionScreenState extends ConsumerState<JobSubmissionScreen> {
           const Divider(height: 16),
           _buildStatusRow(context, job),
         ],
+      ),
+    );
+  }
+
+  Widget _buildJobNameField(BuildContext context, DraftJob job) {
+    return Focus(
+      // Save when the field loses focus, not on every keystroke.
+      onFocusChange: (hasFocus) {
+        if (!hasFocus) _saveJobName(job);
+      },
+      child: TextField(
+        controller: _nameController(job),
+        enabled: job.status != DraftJobStatus.zipping,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _saveJobName(job),
+        decoration: const InputDecoration(
+          labelText: 'Job name',
+          helperText: 'Also the name of the download folder',
+          isDense: true,
+          border: OutlineInputBorder(),
+        ),
       ),
     );
   }

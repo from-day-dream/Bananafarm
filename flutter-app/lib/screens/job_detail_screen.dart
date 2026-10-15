@@ -12,6 +12,10 @@ import '../theme/app_theme.dart';
 import '../utils/format_utils.dart';
 import '../utils/toast_utils.dart';
 import '../utils/job_error_parser.dart';
+import '../widgets/instance_logs_dialog.dart';
+import '../widgets/live_cost_text.dart';
+import '../widgets/slow_start_banner.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class JobDetailScreen extends ConsumerStatefulWidget {
   final String jobId;
@@ -45,8 +49,19 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Reminder: instance keeps billing until manually deleted
-                  if (job.isCompleted && job.hasLiveInstance) ...[
+                  // Starting for unusually long: logs / pick another GPU.
+                  // Renders nothing until the threshold passes.
+                  SlowStartBanner(job: job, replaceCurrent: true),
+                  if (job.isSlowToStart(DateTime.now()))
+                    const SizedBox(height: 16),
+
+                  // Reminder: instance keeps billing until manually deleted.
+                  // Hidden while a download runs — the download card shows it.
+                  if (job.isCompleted &&
+                      job.hasLiveInstance &&
+                      ref.watch(downloadProgressProvider
+                              .select((m) => m[job.id])) ==
+                          null) ...[
                     _buildLiveInstanceBanner(context, job),
                     const SizedBox(height: 16),
                   ],
@@ -131,6 +146,17 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
   Widget _buildActionsRow(BuildContext context, RenderJob job) {
     return Row(
       children: [
+        // Provider logs exist for as long as the instance does.
+        if (job.instanceId != null && !job.instanceDestroyed) ...[
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: () => showInstanceLogs(context, ref, job),
+              icon: const Icon(Icons.article_outlined, size: 18),
+              label: const Text('View Logs'),
+            ),
+          ),
+          const SizedBox(width: 12),
+        ],
         if (job.isActive)
           Expanded(
             child: OutlinedButton.icon(
@@ -153,23 +179,19 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
               style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
             ),
           ),
-        // Shown for any failed job whose project files survive — the shared
-        // dialog can re-pick a GPU when the original offer is unknown.
-        if (job.isFailed && job.canRepickGpu) ...[
+        // Failed or cancelled jobs whose project files survive. Retry turns
+        // the job back into a draft, so this screen is replaced by the
+        // submission page.
+        if (job.canRetry) ...[
           Expanded(
             child: OutlinedButton.icon(
               onPressed: _actionInProgress
                   ? null
                   : () async {
                       setState(() => _actionInProgress = true);
-                      final navigator = Navigator.of(context);
-                      final retried =
-                          await confirmAndRetry(context, ref, job);
-                      if (!mounted) return;
-                      setState(() => _actionInProgress = false);
-                      // The retry has a new id, so this screen is now
-                      // watching a job that no longer exists.
-                      if (retried) navigator.pop();
+                      await confirmAndRetry(context, ref, job,
+                          replaceCurrent: true);
+                      if (mounted) setState(() => _actionInProgress = false);
                     },
               icon: const Icon(Icons.refresh, size: 18),
               label: const Text('Retry Job'),
@@ -294,7 +316,7 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      job.renderParams.originalFilename ?? 'Untitled Job',
+                      job.renderParams.displayName,
                       style: const TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -353,6 +375,24 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
             'Created ${FormatUtils.formatDateTime(job.createdAt)}',
             style: TextStyle(color: Colors.grey[600], fontSize: 12),
           ),
+          if (job.instanceCreatedAt != null) ...[
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Text(
+                  'Instance cost: ',
+                  style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                ),
+                LiveCostText(
+                  job: job,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -439,8 +479,18 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
 
   Widget _buildDownloadCard(BuildContext context, RenderJob job) {
     final destroyed = job.instanceDestroyed;
-    final bg = destroyed ? Colors.grey[100] : Colors.green[50];
-    final border = destroyed ? Colors.grey : Colors.green;
+    final progress =
+        ref.watch(downloadProgressProvider.select((m) => m[job.id]));
+    final failed = progress == null &&
+        !destroyed &&
+        job.downloadState == DownloadState.failed;
+    final downloaded = job.downloadState == DownloadState.downloaded &&
+        job.downloadedTo != null;
+    final bg = failed
+        ? Colors.red[50]
+        : (destroyed && !downloaded ? Colors.grey[100] : Colors.green[50]);
+    final border =
+        failed ? Colors.red : (destroyed && !downloaded ? Colors.grey : Colors.green);
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -476,18 +526,49 @@ class _JobDetailScreenState extends ConsumerState<JobDetailScreen> {
                     color: destroyed ? Colors.grey[800] : Colors.green[900],
                   ),
                 ),
-                Text(
-                  destroyed
-                      ? 'Instance deleted — outputs no longer available'
-                      : '${job.outputFiles.length} file(s) ready on the instance',
-                  style: TextStyle(
-                    color: destroyed ? Colors.grey[600] : Colors.green[800],
-                    fontSize: 12,
+                if (progress != null) ...[
+                  Text(
+                    'Downloading outputs… ${(progress * 100).round()}%',
+                    style: TextStyle(color: Colors.green[800], fontSize: 12),
                   ),
-                ),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(value: progress > 0 ? progress : null),
+                ] else if (failed) ...[
+                  Text(
+                    'Download failed: ${job.downloadError ?? 'unknown error'}',
+                    style: TextStyle(color: Colors.red[800], fontSize: 12),
+                  ),
+                  Text(
+                    'Instance kept — download manually or delete it.',
+                    style: TextStyle(color: Colors.red[700], fontSize: 12),
+                  ),
+                ] else if (downloaded)
+                  Text(
+                    'Saved to ${job.downloadedTo}'
+                    '${destroyed ? ' — instance deleted' : ''}',
+                    style: TextStyle(color: Colors.green[800], fontSize: 12),
+                  )
+                else
+                  Text(
+                    destroyed
+                        ? 'Instance deleted — outputs no longer available'
+                        : '${job.outputFiles.length} file(s) ready on the instance',
+                    style: TextStyle(
+                      color: destroyed ? Colors.grey[600] : Colors.green[800],
+                      fontSize: 12,
+                    ),
+                  ),
               ],
             ),
           ),
+          if (downloaded && progress == null) ...[
+            TextButton.icon(
+              onPressed: () => launchUrl(Uri.file(job.downloadedTo!)),
+              icon: const Icon(Icons.folder_open, size: 16),
+              label: const Text('Open folder'),
+            ),
+            const SizedBox(width: 8),
+          ],
           JobDownloadButton(job: job),
         ],
       ),

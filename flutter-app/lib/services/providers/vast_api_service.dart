@@ -45,7 +45,7 @@ class VastApiService implements GpuProviderService {
   ///
   /// Both the catalog and deployment go through here, so the tier the user
   /// browsed is necessarily the tier they rent from.
-  Map<String, dynamic> _searchBody({String? gpuName}) => {
+  Map<String, dynamic> _searchBody({String? gpuName, required int diskGb}) => {
         // `verified` is Vast's host-vetting flag and applies to both tiers —
         // it is a quality gate, not the secure/standard selector. The tier is
         // `datacenter`, which narrows to Vast's trusted-datacenter partners;
@@ -62,13 +62,18 @@ class VastApiService implements GpuProviderService {
         // Only machines with open ports can expose the container API.
         'direct_port_count': {'gt': 0},
         if (gpuName != null) 'gpu_name': {'eq': gpuName},
+        // Prices each offer's storage at this size, so dph_total is the full
+        // hourly rate for the disk we will actually rent. Storage rates vary
+        // widely by host, so this changes which offer is cheapest.
+        'allocated_storage': diskGb,
       };
 
-  Future<List<dynamic>> _searchOffers({String? gpuName}) async {
+  Future<List<dynamic>> _searchOffers(
+      {String? gpuName, required int diskGb}) async {
     final response = await _request(
       () => _dio.post(
         '$_baseUrl/bundles/',
-        data: _searchBody(gpuName: gpuName),
+        data: _searchBody(gpuName: gpuName, diskGb: diskGb),
         options: Options(headers: _headers),
       ),
     );
@@ -80,8 +85,8 @@ class VastApiService implements GpuProviderService {
   }
 
   @override
-  Future<List<GpuOffer>> listGpus() async {
-    final offers = await _searchOffers();
+  Future<List<GpuOffer>> listGpus({required int diskGb}) async {
+    final offers = await _searchOffers(diskGb: diskGb);
 
     // Aggregate offers by GPU model: cheapest price, offer count, memory.
     final byGpu = <String, List<Map<String, dynamic>>>{};
@@ -116,16 +121,18 @@ class VastApiService implements GpuProviderService {
 
   @override
   Future<CreatedInstance> createInstance(InstanceRequest request) async {
-    final offers = await _searchOffers(gpuName: request.gpu.gpuId);
+    final offers =
+        await _searchOffers(gpuName: request.gpu.gpuId, diskGb: request.diskGb);
     if (offers.isEmpty) {
       throw ProviderApiException(
           provider, 'No offers available for ${request.gpu.gpuName}');
     }
 
-    offers.sort((a, b) => ((b['reliability'] as num?) ?? 0)
-        .compareTo((a['reliability'] as num?) ?? 0));
-    final bestOffer = offers.first as Map<String, dynamic>;
-    final offerId = bestOffer['id'];
+    // Cheapest first, so the GPU is rented at the price the picker showed
+    // (listGpus reports each model's cheapest dph_total). Reliability is
+    // already gated by the search filter.
+    offers.sort((a, b) => ((a['dph_total'] as num?) ?? double.infinity)
+        .compareTo((b['dph_total'] as num?) ?? double.infinity));
 
     final env = <String, String>{
       ...GpuProviderService.containerEnv(request),
@@ -137,25 +144,56 @@ class VastApiService implements GpuProviderService {
       'client_id': 'me',
       'image': request.dockerImage,
       'label': 'bananafarm-${request.jobId}',
-      'disk': 60,
+      'disk': request.diskGb,
       'runtype': 'args',
       'env': env,
     };
 
-    final response = await _request(
-      () => _dio.put(
-        '$_baseUrl/asks/$offerId/',
-        data: payload,
-        options: Options(headers: _headers),
-      ),
-    );
+    // Vast's search index lags behind rentals, so the top offer can already
+    // be gone ("no_such_ask"). Always taking offers.first would retry that
+    // same dead offer on every submit; fall through to the next one instead.
+    ProviderApiException? lastGone;
+    for (final offer in offers.take(_maxOfferAttempts)) {
+      final offerId = (offer as Map<String, dynamic>)['id'];
+      final Response response;
+      try {
+        response = await _request(
+          () => _dio.put(
+            '$_baseUrl/asks/$offerId/',
+            data: payload,
+            options: Options(headers: _headers),
+          ),
+        );
+      } on ProviderApiException catch (e) {
+        if (!_isOfferGone(e)) rethrow;
+        print('⚠️ Vast offer $offerId no longer available, trying next');
+        lastGone = e;
+        continue;
+      }
 
-    final data = response.data;
-    if (data is! Map || data['success'] != true || data['new_contract'] == null) {
-      throw ProviderApiException(
-          provider, 'Instance creation failed: ${response.data}');
+      final data = response.data;
+      if (data is! Map || data['success'] != true || data['new_contract'] == null) {
+        throw ProviderApiException(
+            provider, 'Instance creation failed: ${response.data}');
+      }
+      return CreatedInstance(instanceId: data['new_contract'].toString());
     }
-    return CreatedInstance(instanceId: data['new_contract'].toString());
+
+    throw ProviderApiException(
+      provider,
+      'No ${request.gpu.gpuName} offer could be rented — the listed machines '
+      'were taken before the request reached them. Try again or pick another GPU.',
+      statusCode: lastGone?.statusCode,
+    );
+  }
+
+  /// How many offers to try before giving up on a GPU model.
+  static const _maxOfferAttempts = 5;
+
+  /// The offer was rented by someone else (or delisted) after the search.
+  bool _isOfferGone(ProviderApiException e) {
+    final msg = e.message.toLowerCase();
+    return msg.contains('no_such_ask') || msg.contains('is not available');
   }
 
   @override
@@ -184,12 +222,17 @@ class VastApiService implements GpuProviderService {
       return InstanceStatus(state: ProviderInstanceState.missing);
     }
 
+    // The contract's full rate, storage included — set at rental time.
+    final rate = (instance['dph_total'] as num?)?.toDouble();
+
     final actualStatus = (instance['actual_status'] as String?) ?? '';
     if (actualStatus == 'exited' || actualStatus == 'stopped') {
-      return InstanceStatus(state: ProviderInstanceState.stopped);
+      return InstanceStatus(
+          state: ProviderInstanceState.stopped, pricePerHour: rate);
     }
     if (actualStatus != 'running') {
-      return InstanceStatus(state: ProviderInstanceState.pending);
+      return InstanceStatus(
+          state: ProviderInstanceState.pending, pricePerHour: rate);
     }
 
     // Endpoint = public IP + host port mapped to container port 8000.
@@ -205,12 +248,79 @@ class VastApiService implements GpuProviderService {
 
     if (publicIp == null || hostPort == null) {
       // Running but port mapping not published yet — keep polling.
-      return InstanceStatus(state: ProviderInstanceState.pending);
+      return InstanceStatus(
+          state: ProviderInstanceState.pending, pricePerHour: rate);
     }
     return InstanceStatus(
       state: ProviderInstanceState.running,
       endpoint: 'http://${publicIp.trim()}:$hostPort',
+      pricePerHour: rate,
     );
+  }
+
+  @override
+  Future<String> getLogs(
+    String instanceId, {
+    required InstanceLogSource source,
+    int tail = 1000,
+    String? instanceName,
+  }) async {
+    // Vast writes the requested logs to S3 and returns where to fetch them.
+    final response = await _request(
+      () => _dio.put(
+        '$_baseUrl/instances/request_logs/$instanceId/',
+        data: {
+          'tail': '$tail',
+          if (source == InstanceLogSource.system) 'daemon_logs': 'true',
+        },
+        options: Options(headers: _headers),
+      ),
+    );
+    final data = response.data;
+    final url = data is Map ? data['result_url'] as String? : null;
+    if (url == null || url.isEmpty) {
+      throw ProviderApiException(provider,
+          'Logs unavailable: ${data is Map ? data['msg'] ?? data : data}');
+    }
+
+    // The file appears a moment after the request; S3 answers 403/404 until
+    // then. The URL is pre-signed, so no auth header (S3 would reject it).
+    for (var attempt = 1;; attempt++) {
+      try {
+        final logs = await _dio.get<String>(
+          url,
+          options: Options(responseType: ResponseType.plain),
+        );
+        return logs.data ?? '';
+      } on DioException catch (e) {
+        final code = e.response?.statusCode;
+        final notReady = code == 403 || code == 404;
+        if (!notReady || attempt >= _logFetchAttempts) throw _wrap(e);
+        await Future<void>.delayed(_logFetchDelay);
+      }
+    }
+  }
+
+  static const _logFetchAttempts = 5;
+  static const _logFetchDelay = Duration(seconds: 1);
+
+  @override
+  Future<ProviderBalance> getBalance() async {
+    final response = await _request(
+      () => _dio.get(
+        '$_baseUrl/users/current/',
+        options: Options(headers: _headers),
+      ),
+    );
+    final data = response.data;
+    // Prepaid accounts report remaining funds as `credit`; `balance` is the
+    // documented field and the fallback.
+    final value = data is Map ? (data['credit'] ?? data['balance']) : null;
+    if (value is! num) {
+      throw ProviderApiException(
+          provider, 'Unexpected account response: ${response.data}');
+    }
+    return ProviderBalance(balance: value.toDouble());
   }
 
   @override

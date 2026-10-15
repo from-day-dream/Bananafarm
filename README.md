@@ -183,10 +183,16 @@ codegen step to run.
 
 ```bash
 cd docker-image
-docker build --build-arg BUILD_ID=$(git rev-parse --short HEAD) \
+docker build --platform linux/amd64 \
+  --build-arg BUILD_ID=$(git rev-parse --short HEAD) \
   -t docker.io/<you>/bananafarm-render:<tag> .
 docker push docker.io/<you>/bananafarm-render:<tag>
 ```
+
+`--platform linux/amd64` is required when building on Apple Silicon. The CUDA base
+image is amd64-only and every rented GPU host is x86-64, but Docker on an arm64
+Mac would otherwise label the image arm64. Expect a slower build there, since the
+`RUN` steps go through emulation.
 
 `BUILD_ID` is surfaced by `GET /health`. It exists because providers cache images
 by tag, so a node can serve a stale build under the tag you asked for — the stamp

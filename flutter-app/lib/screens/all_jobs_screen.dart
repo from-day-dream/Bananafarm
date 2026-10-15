@@ -6,6 +6,7 @@ import '../models/job_model.dart';
 import 'job_detail_screen.dart';
 import '../widgets/job_download_button.dart';
 import '../widgets/job_retry_action.dart';
+import '../widgets/live_cost_text.dart';
 import '../utils/format_utils.dart';
 import '../utils/job_error_parser.dart';
 import '../utils/toast_utils.dart';
@@ -86,7 +87,7 @@ class AllJobsScreen extends ConsumerWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            job.id.substring(0, 8),
+                            job.renderParams.displayName,
                             style: const TextStyle(
                               fontFamily: 'Urbanist',
                               fontWeight: FontWeight.bold,
@@ -158,6 +159,15 @@ class AllJobsScreen extends ConsumerWidget {
                               fontSize: 12,
                             ),
                           ),
+                        LiveCostText(
+                          job: job,
+                          style: TextStyle(
+                            color: isDark
+                                ? Colors.grey[400]
+                                : Colors.grey[600],
+                            fontSize: 12,
+                          ),
+                        ),
                         if (job.hasLiveInstance)
                           Text(
                             'Instance running — delete after download',
@@ -182,7 +192,7 @@ class AllJobsScreen extends ConsumerWidget {
               children: [
                 // Offered for every failed job, not just ones whose original
                 // GPU is still known — the dialog can re-pick one.
-                if (job.isFailed && job.canRepickGpu) ...[
+                if (job.canRetry) ...[
                   _buildCardAction(
                     isDark: isDark,
                     icon: Icons.refresh,

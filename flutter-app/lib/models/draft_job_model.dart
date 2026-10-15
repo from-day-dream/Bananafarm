@@ -1,4 +1,5 @@
 import 'gpu_offer.dart';
+import 'job_model.dart' show jobDisplayName;
 
 /// Draft job model for jobs awaiting GPU selection and submission
 ///
@@ -57,6 +58,10 @@ class DraftJob {
     this.errorMessage,
     this.status = DraftJobStatus.submitted,
   });
+
+  /// The job's name (editable until submit), falling back to the file name.
+  String get displayName =>
+      jobDisplayName(renderParams['job_name'] as String?, originalFilename);
 
   Map<String, dynamic> toJson() {
     return {

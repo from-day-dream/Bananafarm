@@ -14,6 +14,17 @@ class AppConstants {
   /// keeping them aligned is that all three name the same release.
   static const String defaultBlenderVersion = '5.2.2';
 
+  /// Disk rented with each instance. Holds Blender, the project and its
+  /// renders, and is billed until the instance is deleted.
+  static const int defaultInstanceStorageGb = 32;
+  static const int minInstanceStorageGb = 16;
+  static const int maxInstanceStorageGb = 1000;
+
+  /// How long an instance may take to boot before the app warns that it is
+  /// unusually slow. A normal start (image pull + Blender download) is a few
+  /// minutes; the hard limit that fails the job is in RenderJobManager.
+  static const Duration slowStartWarning = Duration(minutes: 5);
+
   /// Default cap on simultaneously running render jobs.
   static const int defaultMaxConcurrentJobs = 3;
 

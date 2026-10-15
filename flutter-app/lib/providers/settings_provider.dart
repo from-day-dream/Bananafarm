@@ -26,6 +26,13 @@ class SettingsState {
   final bool showNotifications;
   final int maxConcurrentJobs;
 
+  /// Disk size for each rented instance, in GB. Prices in the GPU picker
+  /// include it, and it is what gets rented.
+  final int instanceStorageGb;
+
+  /// Download finished renders, verify them, then delete the instance.
+  final bool autoDownloadAndDelete;
+
   SettingsState({
     this.downloadPath,
     this.labOutputPath,
@@ -33,6 +40,8 @@ class SettingsState {
     this.minimizeToTray = false, // Default to false
     this.showNotifications = true, // Default to true
     this.maxConcurrentJobs = AppConstants.defaultMaxConcurrentJobs,
+    this.instanceStorageGb = AppConstants.defaultInstanceStorageGb,
+    this.autoDownloadAndDelete = true,
   });
 
   SettingsState copyWith({
@@ -42,6 +51,8 @@ class SettingsState {
     bool? minimizeToTray,
     bool? showNotifications,
     int? maxConcurrentJobs,
+    int? instanceStorageGb,
+    bool? autoDownloadAndDelete,
   }) {
     return SettingsState(
       downloadPath: downloadPath ?? this.downloadPath,
@@ -50,6 +61,9 @@ class SettingsState {
       minimizeToTray: minimizeToTray ?? this.minimizeToTray,
       showNotifications: showNotifications ?? this.showNotifications,
       maxConcurrentJobs: maxConcurrentJobs ?? this.maxConcurrentJobs,
+      instanceStorageGb: instanceStorageGb ?? this.instanceStorageGb,
+      autoDownloadAndDelete:
+          autoDownloadAndDelete ?? this.autoDownloadAndDelete,
     );
   }
 }
@@ -69,6 +83,11 @@ class SettingsNotifier extends StateNotifier<SettingsState> {
     final showNotifications = _storage.getBool('show_notifications') ?? true;
     final maxConcurrentJobs = _storage.getInt('max_concurrent_jobs') ??
         AppConstants.defaultMaxConcurrentJobs;
+    final instanceStorageGb = clampInstanceStorageGb(
+        _storage.getInt('instance_storage_gb') ??
+            AppConstants.defaultInstanceStorageGb);
+    final autoDownloadAndDelete =
+        _storage.getBool('auto_download_and_delete') ?? true;
 
     if (path == null) {
       // Default to system downloads directory
@@ -83,12 +102,25 @@ class SettingsNotifier extends StateNotifier<SettingsState> {
       minimizeToTray: minimizeToTray,
       showNotifications: showNotifications,
       maxConcurrentJobs: maxConcurrentJobs,
+      instanceStorageGb: instanceStorageGb,
+      autoDownloadAndDelete: autoDownloadAndDelete,
     );
   }
 
   Future<void> setMaxConcurrentJobs(int value) async {
     await _storage.saveInt('max_concurrent_jobs', value);
     state = state.copyWith(maxConcurrentJobs: value);
+  }
+
+  Future<void> setInstanceStorageGb(int value) async {
+    final clamped = clampInstanceStorageGb(value);
+    await _storage.saveInt('instance_storage_gb', clamped);
+    state = state.copyWith(instanceStorageGb: clamped);
+  }
+
+  Future<void> setAutoDownloadAndDelete(bool value) async {
+    await _storage.saveBool('auto_download_and_delete', value);
+    state = state.copyWith(autoDownloadAndDelete: value);
   }
 
   Future<void> setDownloadPath(String path) async {
@@ -111,3 +143,6 @@ class SettingsNotifier extends StateNotifier<SettingsState> {
     state = state.copyWith(showNotifications: value);
   }
 }
+
+int clampInstanceStorageGb(int value) => value.clamp(
+    AppConstants.minInstanceStorageGb, AppConstants.maxInstanceStorageGb);

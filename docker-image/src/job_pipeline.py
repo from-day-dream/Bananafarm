@@ -8,6 +8,7 @@ zipped and the job ends as partially_completed.
 
 Ported from the old supabase_pod_main.py minus all Supabase/Redis/R2 calls.
 """
+import hashlib
 import subprocess
 import threading
 from pathlib import Path
@@ -207,14 +208,25 @@ def _collect_output_files() -> List[str]:
     return [str(p) for p in sorted(OUTPUT_DIR.rglob("*")) if p.is_file()]
 
 
+def _sha256(path: str) -> str:
+    """Streamed so a multi-GB video or archive never sits in memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _finalize_outputs(job_state: JobState, output_files: List[str], partial: bool) -> None:
     """Zip multi-file outputs, record the listing, and enter a terminal state."""
     if not output_files:
         job_state.set_state(JobStateEnum.FAILED, "No output files generated")
         return
 
+    # The app verifies each download against size + sha256 before it deletes
+    # the instance, which is the only copy of the render.
     job_state.output_files = [
-        {"name": Path(f).name, "size": Path(f).stat().st_size}
+        {"name": Path(f).name, "size": Path(f).stat().st_size, "sha256": _sha256(f)}
         for f in output_files
         if Path(f).exists()
     ]
@@ -233,6 +245,7 @@ def _finalize_outputs(job_state: JobState, output_files: List[str], partial: boo
         job_state.output_archive = {
             "name": zip_name,
             "size": Path(zip_path).stat().st_size,
+            "sha256": _sha256(zip_path),
             "path": zip_path,
         }
 

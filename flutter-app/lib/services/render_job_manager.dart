@@ -6,15 +6,14 @@ import 'dart:math';
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
-import 'package:uuid/uuid.dart';
 
 import '../constants/app_constants.dart';
 import '../models/draft_job_model.dart';
-import '../models/gpu_offer.dart';
 import '../models/instance_models.dart';
 import '../models/job_model.dart';
 import '../models/render_provider.dart';
 import '../providers/api_keys_provider.dart';
+import '../providers/balance_provider.dart';
 import '../providers/draft_job_provider.dart';
 import '../providers/jobs_provider.dart';
 import '../providers/settings_provider.dart';
@@ -22,6 +21,7 @@ import 'app_paths.dart';
 import 'instance_api_service.dart';
 import 'local_jobs_repository.dart';
 import 'notification_service.dart';
+import 'output_download_service.dart';
 import 'providers/gpu_provider_service.dart';
 import 'providers/provider_service_factory.dart';
 
@@ -31,6 +31,11 @@ final renderJobManagerProvider = Provider<RenderJobManager>((ref) {
   return manager;
 });
 
+/// Output download progress (0..1) of jobs downloading right now, by job id —
+/// automatic or from the download button alike.
+final downloadProgressProvider =
+    StateProvider<Map<String, double>>((ref) => const {});
+
 /// Orchestrates the full render lifecycle client-side, replacing the old
 /// Supabase edge functions, Realtime stream and Upstash Redis polling:
 ///
@@ -38,8 +43,10 @@ final renderJobManagerProvider = Provider<RenderJobManager>((ref) {
 ///          -> chunked project upload -> poll /progress
 ///          -> completed (outputs stay on the instance)
 ///
-/// Instances are never destroyed automatically — only by an explicit user
-/// action (cancel, delete instance, delete job). A single 5s timer advances
+/// Instances are destroyed by an explicit user action (cancel, delete
+/// instance, delete job), by the startup/upload timeouts, or — with the
+/// "Auto download & delete instance" setting on — once a finished job's
+/// outputs have been downloaded and verified. A single 5s timer advances
 /// every active job, and [initialize] resumes jobs after an app restart.
 class RenderJobManager {
   static const _pollInterval = Duration(seconds: 5);
@@ -65,6 +72,7 @@ class RenderJobManager {
 
   final Ref _ref;
   final InstanceApiService _instanceApi;
+  final OutputDownloadService _downloader;
 
   LocalJobsRepository? _repo;
   Timer? _pollTimer;
@@ -74,10 +82,17 @@ class RenderJobManager {
   final Map<String, DateTime> _uploadRetryAt = {};
   final Map<String, DateTime> _uploadingSince = {};
   final Map<String, DateTime> _startingSince = {};
-  final Map<String, int> _progressFailures = {};
 
-  RenderJobManager(this._ref, {InstanceApiService? instanceApi})
-      : _instanceApi = instanceApi ?? InstanceApiService();
+  /// Jobs already warned about a slow start, so the notification fires once.
+  final Set<String> _slowStartNotified = {};
+  final Map<String, int> _progressFailures = {};
+  final Set<String> _downloadsInFlight = {};
+
+  RenderJobManager(this._ref,
+      {InstanceApiService? instanceApi, OutputDownloadService? downloader})
+      : _instanceApi = instanceApi ?? InstanceApiService(),
+        _downloader =
+            downloader ?? OutputDownloadService(instanceApi ?? InstanceApiService());
 
   JobsNotifier get _jobs => _ref.read(jobsProvider.notifier);
 
@@ -106,6 +121,19 @@ class RenderJobManager {
     // Drop temp data nothing points at any more: jobs deleted while the app
     // was closed, and folders stranded by a crash mid-submit.
     unawaited(_sweepOrphanedTempData(jobs));
+
+    // A download the app was closed in the middle of: pick the automatic
+    // flow back up, or leave the job showing that it didn't finish.
+    for (final job in jobs.where((j) => j.downloadState == DownloadState.downloading)) {
+      if (job.canDownload && _ref.read(settingsProvider).autoDownloadAndDelete) {
+        unawaited(_autoDownloadAndDelete(job.id));
+      } else {
+        await _saveAndPublish(job.copyWith(
+          downloadState: DownloadState.failed,
+          downloadError: 'Download interrupted when the app closed',
+        ));
+      }
+    }
 
     // Guard against a remount stacking a second, uncancellable poll loop —
     // MainLayoutScreen is both `home:` and the `/dashboard` route.
@@ -168,6 +196,7 @@ class RenderJobManager {
         blenderVersion: draft.blenderVersion,
         renderParams: draft.renderParams,
         apiToken: apiToken,
+        diskGb: _ref.read(settingsProvider).instanceStorageGb,
       ));
     } catch (e) {
       // Leave the draft intact so the user can fix keys/GPU and retry.
@@ -179,9 +208,11 @@ class RenderJobManager {
       status: LocalJobStatus.starting,
       instanceId: instance.instanceId,
       instanceName: instance.instanceName,
+      instanceCreatedAt: DateTime.now(),
     );
     _startingSince[job.id] = DateTime.now();
     await _saveAndPublish(job);
+    _ref.invalidate(balanceProvider);
     print('✅ Instance created for job ${job.id}: ${instance.instanceId} '
         '(${gpu.provider.label})');
     return job;
@@ -189,6 +220,9 @@ class RenderJobManager {
 
   /// Stop an active job: graceful render stop, destroy the instance, keep
   /// the record as cancelled.
+  ///
+  /// The project zip is kept so the job can be retried; it is only reclaimed
+  /// once a completed job's instance is deleted, or the job itself is.
   Future<void> cancelJob(String jobId) async {
     final job = _jobs.byId(jobId);
     if (job == null || !job.isActive) return;
@@ -202,39 +236,29 @@ class RenderJobManager {
       status: LocalJobStatus.cancelled,
       instanceDestroyed: true,
       completedAt: DateTime.now(),
-      clearProjectZipPath: true,
     ));
-    // A deliberate cancel means the user is done with this project — unlike a
-    // failure, there is nothing to retry from.
-    await _cleanupJobTempData(jobId);
   }
 
-  /// Re-run a failed job with the same project and settings.
+  /// Turn a job back into a draft on the submission page, deleting its
+  /// instance if one is still live.
   ///
-  /// The old instance is destroyed and the old record removed; what comes back
-  /// is a genuinely new job (new id, new api token, clean progress) reusing the
-  /// zip already on disk.
-  ///
-  /// Pass [gpuOverride] to rent a different GPU than the one that failed —
-  /// typically because the original class ran out of capacity. Overriding also
-  /// lifts the "we must know the original offer" requirement, so a job saved
-  /// before `gpuOffer` existed can still be re-run by choosing a GPU. The pick
-  /// must be made by the caller *before* this runs, so it stays outside the
-  /// temp-folder rename and its rollback window below.
-  Future<RenderJob> retryJob(String jobId, {GpuOffer? gpuOverride}) async {
+  /// Used by Retry (failed/cancelled jobs, [keepGpu] true so the previous GPU
+  /// is preselected) and by the slow-start warning (a starting instance that
+  /// seems stuck, [keepGpu] false so a different machine gets picked). The
+  /// draft keeps the job's id, so the temp folder holding the project zip
+  /// carries over untouched.
+  Future<void> returnToDraft(String jobId, {required bool keepGpu}) async {
     final old = _jobs.byId(jobId);
     if (old == null) {
       throw StateError('Job no longer exists');
     }
-    if (gpuOverride == null && !old.canRetry) {
-      throw StateError(old.canRepickGpu
-          ? 'The original GPU for this job is unknown — choose a GPU to retry'
-          : 'This job cannot be retried');
+    final starting = old.status == LocalJobStatus.creating ||
+        old.status == LocalJobStatus.starting;
+    if (!starting && !old.canRetry) {
+      throw StateError('This job cannot be sent back to GPU selection');
     }
-    if (gpuOverride != null && !old.canRepickGpu) {
-      throw StateError('This job cannot be retried');
-    }
-    if (!await File(old.projectZipPath!).exists()) {
+    final zipPath = old.projectZipPath;
+    if (zipPath == null || !await File(zipPath).exists()) {
       throw StateError(
           'Project file missing on disk — resend the job from Blender');
     }
@@ -242,59 +266,51 @@ class RenderJobManager {
     if (old.hasLiveInstance) {
       await _destroyWithService(old);
     }
-
-    // Temp folders are named after their job, so the rename keeps the
-    // "folder must match the job id" cleanup guard valid for the new job.
-    final newId = const Uuid().v4();
-    final newDir = Directory(AppPaths.jobDir(newId));
-    await Directory(AppPaths.jobDir(jobId)).rename(newDir.path);
-
-    final draft = DraftJob(
-      id: newId,
-      blendFilePath: p.join(newDir.path, p.basename(old.projectZipPath!)),
-      originalFilename: old.renderParams.originalFilename ?? 'project',
-      // RenderParams round-trips to exactly the keys the addon sent, so the
-      // container receives an identical payload. blender_version rides
-      // alongside rather than inside RenderParams.
-      renderParams: {
-        ...old.renderParams.toJson(),
-        'blender_version': old.blenderVersion,
-      },
-      blenderVersion: old.blenderVersion,
-      createdAt: DateTime.now(),
-      selectedGpu: gpuOverride ?? old.gpuOffer,
-    );
-
-    final RenderJob fresh;
-    try {
-      fresh = await submitJob(draft);
-    } catch (e) {
-      // Put the project back where the old job expects it so it stays
-      // retryable after a transient failure (no stock, bad api key). Never let
-      // a rollback failure mask why the retry actually failed.
-      try {
-        await newDir.rename(AppPaths.jobDir(jobId));
-      } catch (rollbackError) {
-        print('⚠️ Could not restore temp folder for job $jobId: $rollbackError');
-      }
-      rethrow;
-    }
-
     _purgeJobState(jobId);
+
+    final gpu = keepGpu ? old.gpuOffer : null;
+    // The draft is saved before the job is removed, so a crash in between
+    // leaves a duplicate rather than losing the project.
+    await _ref.read(draftJobsProvider.notifier).restoreDraft(DraftJob(
+          id: old.id,
+          blendFilePath: zipPath,
+          originalFilename: old.renderParams.originalFilename ?? 'project',
+          // RenderParams round-trips to exactly the keys the addon sent, so
+          // the container receives an identical payload. blender_version
+          // rides alongside rather than inside RenderParams.
+          renderParams: {
+            ...old.renderParams.toJson(),
+            'blender_version': old.blenderVersion,
+          },
+          blenderVersion: old.blenderVersion,
+          createdAt: DateTime.now(),
+          selectedGpu: gpu,
+          status: gpu != null ? DraftJobStatus.ready : DraftJobStatus.submitted,
+        ));
+
+    // Not _cleanupJobTempData: the draft owns the folder now.
     await _repo?.deleteJob(jobId);
     _jobs.remove(jobId);
-    print('🔁 Retried job $jobId as ${fresh.id}');
-    return fresh;
+    print('↩️ Job $jobId returned to GPU selection');
   }
 
   /// Destroy the provider instance of a finished job (outputs become
   /// unavailable). The job record stays in the history.
+  ///
+  /// For a completed job this is the end of the line, so its project files
+  /// are reclaimed too. Failed and cancelled jobs keep them for a retry.
   Future<void> destroyInstance(String jobId) async {
     final job = _jobs.byId(jobId);
     if (job == null || !job.hasLiveInstance) return;
 
     await _destroyWithService(job);
-    await _saveAndPublish(job.copyWith(instanceDestroyed: true));
+    await _saveAndPublish(job.copyWith(
+      instanceDestroyed: true,
+      clearProjectZipPath: job.isCompleted,
+    ));
+    if (job.isCompleted) {
+      await _cleanupJobTempData(jobId);
+    }
   }
 
   /// Remove a job from history, destroying its instance first if still alive.
@@ -361,6 +377,15 @@ class RenderJobManager {
   }
 
   Future<void> _advanceStarting(RenderJob job) async {
+    if (job.isSlowToStart(DateTime.now()) && _slowStartNotified.add(job.id)) {
+      _notify(
+        'Instance is taking unusually long',
+        '${job.renderParams.displayName} has been starting for over '
+            '${AppConstants.slowStartWarning.inMinutes} minutes. Open the job '
+            'to view its logs or pick another GPU.',
+      );
+    }
+
     final service = _serviceFor(job.provider);
 
     final InstanceStatus status;
@@ -375,6 +400,14 @@ class RenderJobManager {
       print('⚠️ getInstance failed for job ${job.id}, will retry: $e');
       await _checkStartupTimeout(job);
       return;
+    }
+
+    // Record what the provider actually bills, once it reports it — the live
+    // cost uses this rather than the offer price shown before renting.
+    final rate = status.pricePerHour;
+    if (rate != null && rate > 0 && job.ratePerHour != rate) {
+      job = job.copyWith(ratePerHour: rate);
+      await _saveAndPublish(job);
     }
 
     switch (status.state) {
@@ -574,30 +607,132 @@ class RenderJobManager {
         status = LocalJobStatus.failed;
     }
 
-    // A failed render keeps its project so the user can retry it; only a
-    // finished one is safe to reclaim the disk from.
-    final keepProject = status == LocalJobStatus.failed;
-
-    await _saveAndPublish(job.copyWith(
+    // The project is kept whatever the outcome: a failed render can be
+    // retried, and a finished one's files go when its instance is deleted.
+    final finished = job.copyWith(
       status: status,
       outputFiles: outputFiles,
       errorMessage: errorMessage,
       completedAt: DateTime.now(),
-      clearProjectZipPath: !keepProject,
-    ));
-    if (!keepProject) {
-      await _cleanupJobTempData(job.id);
-    }
+    );
+    await _saveAndPublish(finished);
 
+    final autoDownload = finished.canDownload &&
+        _ref.read(settingsProvider).autoDownloadAndDelete;
     _notify(
       status == LocalJobStatus.failed
           ? 'Render failed'
           : 'Render ${status == LocalJobStatus.completed ? 'complete' : 'partially complete'}',
       status == LocalJobStatus.failed
-          ? '${job.renderParams.originalFilename ?? job.id}: ${errorMessage ?? 'unknown error'}'
-          : '${job.renderParams.originalFilename ?? job.id} finished — '
-              'download your files, then delete the instance to stop billing.',
+          ? '${job.renderParams.displayName}: ${errorMessage ?? 'unknown error'}'
+          : autoDownload
+              ? '${job.renderParams.displayName} finished — downloading your '
+                  'files, then the instance will be deleted.'
+              : '${job.renderParams.displayName} finished — '
+                  'download your files, then delete the instance to stop billing.',
     );
+    if (autoDownload) {
+      // Outside the tick: a large download must not hold up other jobs.
+      unawaited(_autoDownloadAndDelete(job.id));
+    }
+  }
+
+  /// Download a finished job's outputs into `<download folder>/<job name>/`,
+  /// verified, and record the outcome on the job. Returns the folder.
+  ///
+  /// Shared by the download button and the automatic flow. Throws (after
+  /// recording the failure on the job) if every retry failed, or a
+  /// [StateError] if the job can't be downloaded right now.
+  Future<String> downloadOutputs(String jobId) async {
+    final job = _jobs.byId(jobId);
+    if (job == null || !job.canDownload) {
+      throw StateError('Outputs are no longer available on the instance');
+    }
+    if (!_downloadsInFlight.add(jobId)) {
+      throw StateError('Already downloading');
+    }
+
+    try {
+      await _saveAndPublish(job.copyWith(
+        downloadState: DownloadState.downloading,
+        clearDownloadError: true,
+      ));
+      _setDownloadProgress(jobId, 0);
+
+      final root = await OutputDownloadService.resolveDownloadRoot(
+          _ref.read(settingsProvider).downloadPath);
+      final folder = await _downloader.downloadJobOutputs(
+        job,
+        downloadRoot: root,
+        onProgress: (f) => _setDownloadProgress(jobId, f),
+      );
+
+      final latest = _jobs.byId(jobId);
+      if (latest != null) {
+        await _saveAndPublish(latest.copyWith(
+          downloadState: DownloadState.downloaded,
+          downloadedTo: folder,
+        ));
+      }
+      return folder;
+    } catch (e) {
+      final latest = _jobs.byId(jobId);
+      if (latest != null) {
+        await _saveAndPublish(latest.copyWith(
+          downloadState: DownloadState.failed,
+          downloadError: '$e',
+        ));
+      }
+      rethrow;
+    } finally {
+      _downloadsInFlight.remove(jobId);
+      _clearDownloadProgress(jobId);
+    }
+  }
+
+  /// The "Auto download & delete instance" flow: delete the instance only
+  /// once every output is safely on disk. On failure the instance is kept so
+  /// nothing is lost, and the job shows why.
+  Future<void> _autoDownloadAndDelete(String jobId) async {
+    final name = _jobs.byId(jobId)?.renderParams.displayName ?? jobId;
+
+    final String folder;
+    try {
+      folder = await downloadOutputs(jobId);
+    } on StateError {
+      return; // already downloading, or nothing left to download
+    } catch (e) {
+      _notify('Auto-download failed',
+          '$name: $e. The instance was kept so you can download manually.');
+      return;
+    }
+
+    try {
+      await destroyInstance(jobId);
+      _notify('Render downloaded',
+          '$name saved to $folder — instance deleted.');
+    } catch (e) {
+      print('⚠️ Could not delete instance after download for job $jobId: $e');
+      _notify('Instance may still be running',
+          '$name was downloaded to $folder, but its instance could not be '
+          'deleted. Delete it from the job to stop billing.');
+    }
+  }
+
+  /// Progress updates arrive per network read; only publish whole percents
+  /// so the UI isn't rebuilt thousands of times per file.
+  void _setDownloadProgress(String jobId, double fraction) {
+    final notifier = _ref.read(downloadProgressProvider.notifier);
+    final previous = notifier.state[jobId];
+    if (previous != null && (fraction - previous).abs() < 0.01 && fraction < 1) {
+      return;
+    }
+    notifier.state = {...notifier.state, jobId: fraction};
+  }
+
+  void _clearDownloadProgress(String jobId) {
+    final notifier = _ref.read(downloadProgressProvider.notifier);
+    notifier.state = {...notifier.state}..remove(jobId);
   }
 
   // ============================================
@@ -614,7 +749,7 @@ class RenderJobManager {
       completedAt: DateTime.now(),
     ));
     _notify('Render failed',
-        '${job.renderParams.originalFilename ?? job.id}: $message');
+        '${job.renderParams.displayName}: $message');
   }
 
   Future<void> _saveAndPublish(RenderJob job) async {
@@ -627,6 +762,7 @@ class RenderJobManager {
     final service = _serviceFor(job.provider);
     await service.destroyInstance(job.instanceId!,
         instanceName: job.instanceName);
+    _ref.invalidate(balanceProvider);
   }
 
   GpuProviderService _serviceFor(RenderProvider provider) {
@@ -653,6 +789,7 @@ class RenderJobManager {
     _uploadingSince.remove(jobId);
     _startingSince.remove(jobId);
     _progressFailures.remove(jobId);
+    _slowStartNotified.remove(jobId);
   }
 
   /// Delete a job's temp folder.

@@ -4,12 +4,17 @@ import '../theme/app_theme.dart';
 import '../models/job_model.dart';
 import 'job_submission_screen.dart';
 import 'job_detail_screen.dart';
+import '../models/render_provider.dart';
 import '../providers/addon_provider.dart';
+import '../providers/api_keys_provider.dart';
+import '../providers/balance_provider.dart';
 import '../providers/draft_job_provider.dart';
 import '../providers/jobs_provider.dart';
 import '../models/draft_job_model.dart';
 import '../widgets/draft_job_status_badge.dart';
 import '../widgets/addon_config_modal.dart';
+import '../widgets/live_cost_text.dart';
+import '../widgets/slow_start_banner.dart';
 import '../widgets/live_job_progress_display.dart';
 import '../utils/job_error_parser.dart';
 
@@ -27,6 +32,12 @@ class DashboardScreen extends ConsumerWidget {
     final completedCount = jobs.where((j) => j.isCompleted).length;
     final liveInstances =
         jobs.where((j) => !j.isActive && j.hasLiveInstance).length;
+    final balanceFamilies = ref
+        .watch(configuredProvidersProvider)
+        .map((p) => p.family)
+        .where((f) => f != RenderProviderFamily.salad)
+        .toSet()
+        .toList();
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -194,6 +205,19 @@ class DashboardScreen extends ConsumerWidget {
             ],
           ),
 
+          // Provider balances, one card per provider with a key
+          if (balanceFamilies.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                for (final (i, family) in balanceFamilies.indexed) ...[
+                  if (i > 0) const SizedBox(width: 16),
+                  Expanded(child: _buildBalanceCard(context, ref, family)),
+                ],
+              ],
+            ),
+          ],
+
           const SizedBox(height: 32),
 
           // Running Job Section
@@ -250,7 +274,7 @@ class DashboardScreen extends ConsumerWidget {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      'Job Error: ${job.originalFilename}',
+                                      'Job Error: ${job.displayName}',
                                       style: const TextStyle(
                                         fontWeight: FontWeight.bold,
                                         color: Colors.red,
@@ -327,7 +351,7 @@ class DashboardScreen extends ConsumerWidget {
                         children: [
                           Expanded(
                             child: Text(
-                              job.originalFilename,
+                              job.displayName,
                               style: const TextStyle(
                                 fontWeight: FontWeight.bold,
                               ),
@@ -414,12 +438,50 @@ class DashboardScreen extends ConsumerWidget {
     );
   }
 
+  Widget _buildBalanceCard(
+    BuildContext context,
+    WidgetRef ref,
+    RenderProviderFamily family,
+  ) {
+    final balance = ref.watch(balanceProvider(family));
+    final title = '${family.label} Balance';
+    return balance.when(
+      data: (b) => _buildStatsCard(
+        context,
+        title: title,
+        value: '\$${b.balance.toStringAsFixed(2)}',
+        subtitle: b.spendPerHour != null && b.spendPerHour! > 0
+            ? '\$${b.spendPerHour!.toStringAsFixed(2)}/hr now'
+            : null,
+        isAccent: false,
+      ),
+      loading: () => _buildStatsCard(
+        context,
+        title: title,
+        value: '…',
+        isAccent: false,
+      ),
+      error: (e, _) => _buildStatsCard(
+        context,
+        title: title,
+        value: '—',
+        subtitle: 'Could not load',
+        tooltip: e.toString(),
+        isAccent: false,
+      ),
+      // Keep the last value on screen during the minute-by-minute refresh.
+      skipLoadingOnRefresh: true,
+    );
+  }
+
   Widget _buildStatsCard(
     BuildContext context, {
     required String title,
     required String value,
     required bool isAccent,
     List<Widget>? actions,
+    String? subtitle,
+    String? tooltip,
   }) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final bgColor = isAccent
@@ -452,14 +514,31 @@ class DashboardScreen extends ConsumerWidget {
                   color: textColor.withOpacity(0.7),
                 ),
               ),
-              Text(
-                value,
-                style: TextStyle(
-                  fontFamily: 'Urbanist',
-                  fontWeight: FontWeight.w600,
-                  fontSize: 32,
-                  color: textColor,
-                ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Tooltip(
+                    message: tooltip ?? '',
+                    child: Text(
+                      value,
+                      style: TextStyle(
+                        fontFamily: 'Urbanist',
+                        fontWeight: FontWeight.w600,
+                        fontSize: 32,
+                        color: textColor,
+                      ),
+                    ),
+                  ),
+                  if (subtitle != null)
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontFamily: 'Urbanist',
+                        fontSize: 12,
+                        color: textColor.withOpacity(0.7),
+                      ),
+                    ),
+                ],
               ),
             ],
           ),
@@ -541,7 +620,7 @@ class DashboardScreen extends ConsumerWidget {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      job.id.substring(0, 8),
+                      job.renderParams.displayName,
                       style: const TextStyle(
                         fontFamily: 'Urbanist',
                         fontWeight: FontWeight.bold,
@@ -576,8 +655,16 @@ class DashboardScreen extends ConsumerWidget {
                     fontSize: 14,
                   ),
                 ),
+                LiveCostText(
+                  job: job,
+                  style: TextStyle(
+                    color: isDark ? Colors.grey[400] : Colors.grey[600],
+                    fontSize: 13,
+                  ),
+                ),
                 const SizedBox(height: 12),
                 LiveJobProgressDisplay(job: job, compact: true),
+                SlowStartBanner(job: job, compact: true),
               ],
             ),
           ),

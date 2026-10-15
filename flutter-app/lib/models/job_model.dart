@@ -50,6 +50,10 @@ class RenderProgressSnapshot {
   final double progressPercent;
   final int currentFrame;
   final int totalFrames;
+
+  /// Frames fully rendered so far. 0 from render image builds that
+  /// predate the progress reporter, which did not report it.
+  final int framesDone;
   final int currentSample;
   final int totalSamples;
   final int tilesDone;
@@ -60,6 +64,7 @@ class RenderProgressSnapshot {
     this.progressPercent = 0,
     this.currentFrame = 0,
     this.totalFrames = 0,
+    this.framesDone = 0,
     this.currentSample = 0,
     this.totalSamples = 0,
     this.tilesDone = 0,
@@ -72,6 +77,7 @@ class RenderProgressSnapshot {
       progressPercent: (json['progress_percent'] as num?)?.toDouble() ?? 0,
       currentFrame: (json['current_frame'] as num?)?.toInt() ?? 0,
       totalFrames: (json['total_frames'] as num?)?.toInt() ?? 0,
+      framesDone: (json['frames_done'] as num?)?.toInt() ?? 0,
       currentSample: (json['current_sample'] as num?)?.toInt() ?? 0,
       totalSamples: (json['total_samples'] as num?)?.toInt() ?? 0,
       tilesDone: (json['tiles_done'] as num?)?.toInt() ?? 0,
@@ -84,6 +90,7 @@ class RenderProgressSnapshot {
         'progress_percent': progressPercent,
         'current_frame': currentFrame,
         'total_frames': totalFrames,
+        'frames_done': framesDone,
         'current_sample': currentSample,
         'total_samples': totalSamples,
         'tiles_done': tilesDone,
@@ -98,17 +105,35 @@ class OutputFileInfo {
   final int size;
   final bool isArchive;
 
-  OutputFileInfo({required this.name, required this.size, this.isArchive = false});
+  /// Checksum computed by the container, used to verify a download before
+  /// the instance (the only copy) is deleted. Null from older images, which
+  /// are verified by size alone.
+  final String? sha256;
+
+  OutputFileInfo({
+    required this.name,
+    required this.size,
+    this.isArchive = false,
+    this.sha256,
+  });
 
   factory OutputFileInfo.fromJson(Map<String, dynamic> json) => OutputFileInfo(
         name: json['name'] as String,
         size: (json['size'] as num?)?.toInt() ?? 0,
         isArchive: json['is_archive'] as bool? ?? false,
+        sha256: json['sha256'] as String?,
       );
 
-  Map<String, dynamic> toJson() =>
-      {'name': name, 'size': size, 'is_archive': isArchive};
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'size': size,
+        'is_archive': isArchive,
+        'sha256': sha256,
+      };
 }
+
+/// Where a finished job's outputs are in getting to this machine.
+enum DownloadState { none, downloading, downloaded, failed }
 
 /// A render job orchestrated entirely by this app: it owns the provider
 /// instance and talks to the render container directly. Persisted locally.
@@ -153,6 +178,27 @@ class RenderJob {
   /// longer downloadable after that.
   final bool instanceDestroyed;
 
+  /// When the provider instance was rented — billing starts here.
+  final DateTime? instanceCreatedAt;
+
+  /// When the instance was deleted — billing stops here. Set automatically
+  /// by [copyWith] when [instanceDestroyed] flips to true.
+  final DateTime? instanceDestroyedAt;
+
+  /// The instance's actual $/hr as reported by the provider once rented.
+  /// [pricePerHour] is the offer shown before renting and can differ.
+  final double? ratePerHour;
+
+  /// Progress of getting the outputs onto this machine, automatically or by
+  /// the download button.
+  final DownloadState downloadState;
+
+  /// Folder the outputs were saved to, once downloaded.
+  final String? downloadedTo;
+
+  /// Why the last download failed, shown until the next attempt.
+  final String? downloadError;
+
   final String? errorMessage;
   final DateTime createdAt;
   final DateTime? completedAt;
@@ -174,6 +220,12 @@ class RenderJob {
     this.progress,
     this.outputFiles = const [],
     this.instanceDestroyed = false,
+    this.instanceCreatedAt,
+    this.instanceDestroyedAt,
+    this.ratePerHour,
+    this.downloadState = DownloadState.none,
+    this.downloadedTo,
+    this.downloadError,
     this.errorMessage,
     required this.createdAt,
     this.completedAt,
@@ -199,21 +251,41 @@ class RenderJob {
   bool get canDownload =>
       isCompleted && hasLiveInstance && outputFiles.isNotEmpty;
 
-  /// A failed job can be re-run on the *same* GPU only if we still know which
-  /// GPU to rent and still hold the project zip — the finalize path keeps both
-  /// on failure.
-  bool get canRetry => canRepickGpu && gpuOffer != null;
+  /// A failed or cancelled job can be retried while its project zip survives.
+  /// Retry reopens the submission page, where the previous GPU is preselected
+  /// if known and can be changed, so the original offer is not required.
+  bool get canRetry =>
+      (isFailed || isCancelled) &&
+      projectZipPath != null &&
+      projectZipPath!.isNotEmpty;
 
-  /// A failed job can be re-run on a *different* GPU as long as the project zip
-  /// survives. Unlike [canRetry] this does not need the original offer, so jobs
-  /// persisted before `gpuOffer` existed stay recoverable by picking a new GPU.
-  bool get canRepickGpu =>
-      isFailed && projectZipPath != null && projectZipPath!.isNotEmpty;
+  /// Still waiting for its instance well past a normal boot — the user is
+  /// offered logs and a way back to GPU selection.
+  bool isSlowToStart(DateTime now) =>
+      status == LocalJobStatus.starting &&
+      now.difference(instanceCreatedAt ?? createdAt) >=
+          AppConstants.slowStartWarning;
 
   Duration? get duration =>
       completedAt != null ? completedAt!.difference(createdAt) : null;
 
   String get statusLabel => status.label;
+
+  /// The best known hourly rate: the provider's reported rate once rented,
+  /// otherwise the offer price.
+  double? get effectiveRatePerHour => ratePerHour ?? pricePerHour;
+
+  /// Instance cost so far: rate × time from rental to deletion (or [now]).
+  /// Null when the rental time or rate is unknown, e.g. for jobs saved
+  /// before cost tracking existed.
+  double? costSoFar(DateTime now) {
+    final start = instanceCreatedAt;
+    final rate = effectiveRatePerHour;
+    if (start == null || rate == null) return null;
+    final end = instanceDestroyedAt ?? now;
+    final hours = end.difference(start).inMilliseconds / Duration.millisecondsPerHour;
+    return hours <= 0 ? 0 : rate * hours;
+  }
 
   RenderJob copyWith({
     LocalJobStatus? status,
@@ -225,9 +297,17 @@ class RenderJob {
     RenderProgressSnapshot? progress,
     List<OutputFileInfo>? outputFiles,
     bool? instanceDestroyed,
+    DateTime? instanceCreatedAt,
+    double? ratePerHour,
+    DownloadState? downloadState,
+    String? downloadedTo,
+    String? downloadError,
+    bool clearDownloadError = false,
     String? errorMessage,
     DateTime? completedAt,
   }) {
+    final destroyed = instanceDestroyed ?? this.instanceDestroyed;
+    final createdInstanceAt = instanceCreatedAt ?? this.instanceCreatedAt;
     return RenderJob(
       id: id,
       status: status ?? this.status,
@@ -245,7 +325,17 @@ class RenderJob {
       renderParams: renderParams,
       progress: progress ?? this.progress,
       outputFiles: outputFiles ?? this.outputFiles,
-      instanceDestroyed: instanceDestroyed ?? this.instanceDestroyed,
+      instanceDestroyed: destroyed,
+      instanceCreatedAt: createdInstanceAt,
+      // Every destroy path goes through copyWith(instanceDestroyed: true), so
+      // stamping here stops the cost clock without touching each of them.
+      instanceDestroyedAt: instanceDestroyedAt ??
+          (destroyed && createdInstanceAt != null ? DateTime.now() : null),
+      ratePerHour: ratePerHour ?? this.ratePerHour,
+      downloadState: downloadState ?? this.downloadState,
+      downloadedTo: downloadedTo ?? this.downloadedTo,
+      downloadError:
+          clearDownloadError ? null : (downloadError ?? this.downloadError),
       errorMessage: errorMessage ?? this.errorMessage,
       createdAt: createdAt,
       completedAt: completedAt ?? this.completedAt,
@@ -284,6 +374,15 @@ class RenderJob {
           .map((f) => OutputFileInfo.fromJson((f as Map).cast<String, dynamic>()))
           .toList(),
       instanceDestroyed: json['instance_destroyed'] as bool? ?? false,
+      instanceCreatedAt: _parseDate(json['instance_created_at']),
+      instanceDestroyedAt: _parseDate(json['instance_destroyed_at']),
+      ratePerHour: (json['rate_per_hour'] as num?)?.toDouble(),
+      downloadState: DownloadState.values.firstWhere(
+        (s) => s.name == json['download_state'],
+        orElse: () => DownloadState.none,
+      ),
+      downloadedTo: json['downloaded_to'] as String?,
+      downloadError: json['download_error'] as String?,
       errorMessage: json['error_message'] as String?,
       createdAt: DateTime.parse(json['created_at'] as String),
       completedAt: json['completed_at'] != null
@@ -309,10 +408,19 @@ class RenderJob {
         'progress': progress?.toJson(),
         'output_files': outputFiles.map((f) => f.toJson()).toList(),
         'instance_destroyed': instanceDestroyed,
+        'instance_created_at': instanceCreatedAt?.toIso8601String(),
+        'instance_destroyed_at': instanceDestroyedAt?.toIso8601String(),
+        'rate_per_hour': ratePerHour,
+        'download_state': downloadState.name,
+        'downloaded_to': downloadedTo,
+        'download_error': downloadError,
         'error_message': errorMessage,
         'created_at': createdAt.toIso8601String(),
         'completed_at': completedAt?.toIso8601String(),
       };
+
+  static DateTime? _parseDate(Object? value) =>
+      value is String ? DateTime.tryParse(value) : null;
 }
 
 class RenderParams {
@@ -329,6 +437,11 @@ class RenderParams {
   final bool isImageSequence;
   final String? originalFilename;
 
+  /// User-facing job name, set by the app when the draft arrives and editable
+  /// until submit. Also names the download folder. Null on jobs saved before
+  /// job names existed — use [displayName].
+  final String? jobName;
+
   RenderParams({
     required this.frameStart,
     required this.frameEnd,
@@ -342,6 +455,7 @@ class RenderParams {
     this.isVideoOutput = false,
     this.isImageSequence = false,
     this.originalFilename,
+    this.jobName,
   });
 
   factory RenderParams.fromJson(Map<String, dynamic> json) {
@@ -358,6 +472,7 @@ class RenderParams {
       isVideoOutput: json['is_video_output'] as bool? ?? false,
       isImageSequence: json['is_image_sequence'] as bool? ?? false,
       originalFilename: json['original_filename'] as String?,
+      jobName: json['job_name'] as String?,
     );
   }
 
@@ -374,9 +489,13 @@ class RenderParams {
         'is_video_output': isVideoOutput,
         'is_image_sequence': isImageSequence,
         'original_filename': originalFilename,
+        'job_name': jobName,
       };
 
   bool get isAnimation => isAnimationRender;
+
+  /// The job's name, falling back to the .blend name for older jobs.
+  String get displayName => jobDisplayName(jobName, originalFilename);
 
   int get width {
     final parts = resolution.split('x');
@@ -393,4 +512,14 @@ class RenderParams {
     }
     return 1080;
   }
+}
+
+/// Job name if set, otherwise the file name without its extension.
+String jobDisplayName(String? jobName, String? originalFilename) {
+  final name = jobName?.trim();
+  if (name != null && name.isNotEmpty) return name;
+  final file = originalFilename?.trim() ?? '';
+  if (file.isEmpty) return 'project';
+  final dot = file.lastIndexOf('.');
+  return dot > 0 ? file.substring(0, dot) : file;
 }

@@ -4,6 +4,8 @@ import '../providers/jobs_provider.dart';
 import '../models/job_model.dart';
 import 'job_detail_screen.dart';
 import '../widgets/live_job_progress_display.dart';
+import '../widgets/live_cost_text.dart';
+import '../widgets/slow_start_banner.dart';
 
 class AllRunningJobsScreen extends ConsumerWidget {
   const AllRunningJobsScreen({Key? key}) : super(key: key);
@@ -88,7 +90,7 @@ class AllRunningJobsScreen extends ConsumerWidget {
                       MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      job.id.substring(0, 8),
+                      job.renderParams.displayName,
                       style: const TextStyle(
                         fontFamily: 'Urbanist',
                         fontWeight: FontWeight.bold,
@@ -125,8 +127,18 @@ class AllRunningJobsScreen extends ConsumerWidget {
                     fontSize: 14,
                   ),
                 ),
+                LiveCostText(
+                  job: job,
+                  style: TextStyle(
+                    color: isDark
+                        ? Colors.grey[400]
+                        : Colors.grey[600],
+                    fontSize: 13,
+                  ),
+                ),
                 const SizedBox(height: 12),
                 LiveJobProgressDisplay(job: job, compact: true),
+                SlowStartBanner(job: job, compact: true),
               ],
             ),
           ),

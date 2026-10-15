@@ -1,8 +1,7 @@
-// Unit tests for the two retry gates on RenderJob.
+// Unit tests for RenderJob's retry gate and slow-start check.
 //
-// canRetry (same GPU) needs the original offer; canRepickGpu (different GPU)
-// only needs the project zip, so jobs saved before `gpuOffer` existed stay
-// recoverable by choosing a GPU rather than silently losing their retry button.
+// Retry reopens the submission page, so it needs only the project zip — the
+// original GPU is preselected when known and picked there otherwise.
 
 import 'package:flutter_test/flutter_test.dart';
 
@@ -36,28 +35,24 @@ final _offer = GpuOffer(
 );
 
 void main() {
-  group('canRetry / canRepickGpu', () {
-    test('failed job with offer and zip supports both paths', () {
-      final job = _job(
-        status: LocalJobStatus.failed,
-        gpuOffer: _offer,
-        projectZipPath: '/tmp/p.zip',
-      );
-      expect(job.canRetry, isTrue);
-      expect(job.canRepickGpu, isTrue);
+  group('canRetry', () {
+    test('failed and cancelled jobs with their zip can be retried', () {
+      for (final status in [LocalJobStatus.failed, LocalJobStatus.cancelled]) {
+        final job = _job(status: status, projectZipPath: '/tmp/p.zip');
+        expect(job.canRetry, isTrue, reason: '$status');
+      }
     });
 
-    test('legacy failed job without an offer can still re-pick a GPU', () {
+    test('the original GPU is not required — it is re-picked on submit', () {
       final job = _job(
         status: LocalJobStatus.failed,
         gpuOffer: null,
         projectZipPath: '/tmp/p.zip',
       );
-      expect(job.canRetry, isFalse, reason: 'original GPU is unknown');
-      expect(job.canRepickGpu, isTrue, reason: 'zip survives, so pick a GPU');
+      expect(job.canRetry, isTrue);
     });
 
-    test('failed job whose zip was reclaimed supports neither', () {
+    test('a job whose zip was reclaimed cannot be retried', () {
       for (final path in <String?>[null, '']) {
         final job = _job(
           status: LocalJobStatus.failed,
@@ -65,30 +60,50 @@ void main() {
           projectZipPath: path,
         );
         expect(job.canRetry, isFalse);
-        expect(job.canRepickGpu, isFalse);
       }
     });
 
-    test('non-failed statuses are never retryable', () {
+    test('active and completed jobs are never retryable', () {
       for (final status in LocalJobStatus.values) {
-        if (status == LocalJobStatus.failed) continue;
+        if (status == LocalJobStatus.failed ||
+            status == LocalJobStatus.cancelled) {
+          continue;
+        }
         final job = _job(
           status: status,
           gpuOffer: _offer,
           projectZipPath: '/tmp/p.zip',
         );
         expect(job.canRetry, isFalse, reason: '$status');
-        expect(job.canRepickGpu, isFalse, reason: '$status');
       }
     });
+  });
 
-    test('cancelled is deliberately excluded', () {
-      final job = _job(
-        status: LocalJobStatus.cancelled,
-        gpuOffer: _offer,
-        projectZipPath: '/tmp/p.zip',
-      );
-      expect(job.canRepickGpu, isFalse);
+  group('isSlowToStart', () {
+    final rented = DateTime(2026, 10, 15, 12);
+    RenderJob starting() => RenderJob(
+          id: 'job-1',
+          status: LocalJobStatus.starting,
+          provider: RenderProvider.vast,
+          gpuName: 'RTX 4090',
+          apiToken: 'token',
+          blenderVersion: '5.0.1',
+          renderParams: RenderParams.fromJson(const {}),
+          createdAt: rented,
+          instanceCreatedAt: rented,
+        );
+
+    test('false before 5 minutes, true after', () {
+      expect(starting().isSlowToStart(rented.add(const Duration(minutes: 4))),
+          isFalse);
+      expect(starting().isSlowToStart(rented.add(const Duration(minutes: 5))),
+          isTrue);
+    });
+
+    test('only applies while starting', () {
+      final rendering = starting().copyWith(status: LocalJobStatus.rendering);
+      expect(rendering.isSlowToStart(rented.add(const Duration(hours: 1))),
+          isFalse);
     });
   });
 }

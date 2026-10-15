@@ -9,6 +9,7 @@ import '../providers/theme_provider.dart' as theme_provider;
 import '../theme/app_theme.dart';
 import '../utils/toast_utils.dart';
 import 'package:file_picker/file_picker.dart';
+import '../constants/app_constants.dart';
 import '../providers/settings_provider.dart';
 import '../services/notification_service.dart';
 
@@ -25,6 +26,7 @@ class ProfileScreen extends ConsumerStatefulWidget {
 class _ProfileScreenState extends ConsumerState<ProfileScreen> {
   late TextEditingController _portController;
   late TextEditingController _maxJobsController;
+  late TextEditingController _storageController;
   final _vastKeyController = TextEditingController();
   final _runpodKeyController = TextEditingController();
 
@@ -42,6 +44,12 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     _maxJobsController.addListener(() {
       setState(() {});
     });
+    _storageController = TextEditingController(
+      text: ref.read(settingsProvider).instanceStorageGb.toString(),
+    );
+    _storageController.addListener(() {
+      setState(() {});
+    });
     for (final c in [
       _vastKeyController,
       _runpodKeyController,
@@ -54,6 +62,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
   void dispose() {
     _portController.dispose();
     _maxJobsController.dispose();
+    _storageController.dispose();
     _vastKeyController.dispose();
     _runpodKeyController.dispose();
     super.dispose();
@@ -74,6 +83,8 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     final settings = ref.watch(settingsProvider);
     final isMaxJobsChanged = _maxJobsController.text.isNotEmpty &&
         _maxJobsController.text != settings.maxConcurrentJobs.toString();
+    final isStorageChanged = _storageController.text.isNotEmpty &&
+        _storageController.text != settings.instanceStorageGb.toString();
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -181,6 +192,75 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                 keyboardType: TextInputType.number,
               ),
             ),
+          ),
+          const SizedBox(height: 8),
+
+          // Disk rented with each instance
+          _buildInputCard(
+            context,
+            isDarkMode: isDarkMode,
+            icon: Icons.storage,
+            title: 'Instance Storage (GB)',
+            child: SizedBox(
+              height: 40,
+              child: TextField(
+                controller: _storageController,
+                decoration: _inputDecoration(
+                  isDarkMode,
+                  suffixIcon: isStorageChanged
+                      ? _tickButton(() {
+                          final value = int.tryParse(_storageController.text);
+                          if (value != null &&
+                              value >= AppConstants.minInstanceStorageGb &&
+                              value <= AppConstants.maxInstanceStorageGb) {
+                            ref
+                                .read(settingsProvider.notifier)
+                                .setInstanceStorageGb(value);
+                            ToastUtils.showSuccess(
+                              ScaffoldMessenger.of(context),
+                              'Instance storage set to $value GB',
+                            );
+                          } else {
+                            ToastUtils.showError(
+                              ScaffoldMessenger.of(context),
+                              'Enter a number between '
+                              '${AppConstants.minInstanceStorageGb} and '
+                              '${AppConstants.maxInstanceStorageGb}',
+                            );
+                          }
+                        })
+                      : null,
+                ),
+                style: Theme.of(context).textTheme.bodyMedium,
+                keyboardType: TextInputType.number,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 4, top: 4),
+            child: Text(
+              'Disk for each rented machine. Must fit Blender, your project '
+              'and its renders. Billed until the instance is deleted.',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey[600]),
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          _buildSwitchCard(
+            context,
+            icon: Icons.cloud_download_outlined,
+            title: 'Auto download & delete instance',
+            subtitle: 'Download finished renders, verify them, then delete '
+                'the instance to stop billing',
+            value: ref.watch(settingsProvider).autoDownloadAndDelete,
+            onChanged: (value) {
+              ref
+                  .read(settingsProvider.notifier)
+                  .setAutoDownloadAndDelete(value);
+            },
           ),
           const SizedBox(height: 8),
 

@@ -38,7 +38,7 @@ class DraftJobsScreen extends ConsumerWidget {
                 return Card(
                   child: ListTile(
                     title: Text(
-                      job.originalFilename,
+                      job.displayName,
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                     subtitle: Text('Created: ${_formatDate(job.createdAt)}'),

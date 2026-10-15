@@ -53,7 +53,7 @@ class SaladApiService implements GpuProviderService {
   }
 
   @override
-  Future<List<GpuOffer>> listGpus() async {
+  Future<List<GpuOffer>> listGpus({required int diskGb}) async {
     final classes = await _fetchGpuClasses();
 
     final offers = <GpuOffer>[];
@@ -252,6 +252,21 @@ class SaladApiService implements GpuProviderService {
       throw _wrap(e);
     }
   }
+
+  /// Salad is withdrawn (see ApiKeysState.configuredProviders), so its
+  /// balance is never shown.
+  @override
+  Future<ProviderBalance> getBalance() =>
+      throw UnsupportedError('Salad balance is not supported');
+
+  @override
+  Future<String> getLogs(
+    String instanceId, {
+    required InstanceLogSource source,
+    int tail = 1000,
+    String? instanceName,
+  }) =>
+      throw UnsupportedError('Salad logs are not supported');
 
   Future<Response> _request(Future<Response> Function() fn) async {
     try {

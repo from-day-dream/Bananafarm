@@ -42,3 +42,6 @@ venv/
 
 # Claude Code local state
 .claude/
+
+# GitHub release notes (pasted into the release, not tracked)
+RELEASE_NOTES.md

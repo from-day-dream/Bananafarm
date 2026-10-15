@@ -7,6 +7,8 @@ import '../services/app_paths.dart';
 import '../services/render_job_manager.dart';
 import '../models/draft_job_model.dart';
 import '../providers/draft_job_provider.dart';
+import '../providers/jobs_provider.dart';
+import '../utils/format_utils.dart';
 import '../constants/app_constants.dart';
 
 /// Single instance of addon service
@@ -193,6 +195,18 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
       }
 
       final persistentZipPath = p.join(jobDir.path, destFilename);
+
+      // Default job name: the .blend name, suffixed (_2, _3, …) when a draft,
+      // queued job or history entry already uses it. Editable in the app
+      // until submit; it also names the download folder.
+      final existingNames = [
+        ..._ref.read(draftJobsProvider).map((d) => d.displayName),
+        ..._ref.read(jobsProvider).map((j) => j.renderParams.displayName),
+      ];
+      renderParams['job_name'] = FormatUtils.uniqueJobName(
+        p.basenameWithoutExtension(originalFilename),
+        existingNames,
+      );
 
       // Create a draft job via the provider using the persistent path AND the generated ID
       // Initial status is zipping

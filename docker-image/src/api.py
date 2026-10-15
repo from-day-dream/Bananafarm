@@ -316,6 +316,7 @@ def list_outputs():
         archive = {
             "name": job_state.output_archive["name"],
             "size": job_state.output_archive["size"],
+            "sha256": job_state.output_archive.get("sha256"),
         }
     return {
         "state": job_state.state.value,

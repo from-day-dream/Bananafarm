@@ -7,23 +7,10 @@ import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 
 import '../models/job_model.dart';
-
-/// Streams a file through SHA-256 on a worker isolate.
-///
-/// Hashing a multi-GB project zip on the UI isolate froze the Windows app: the
-/// synchronous per-block work stops the platform thread from pumping messages
-/// while every 64KB read completion keeps posting to the embedder's task
-/// runner, whose message queue is capped at 10,000 entries. Past that,
-/// PostMessage fails and the embedder logs "Failed to post message to main
-/// thread" until the app is unusable.
-Future<String> _hashFileInIsolate(String path) {
-  return Isolate.run(() async {
-    return (await sha256.bind(File(path).openRead()).first).toString();
-  });
-}
+import '../utils/file_hash.dart';
 
 /// Reads one chunk and hashes it on a worker isolate, for the same reason as
-/// [_hashFileInIsolate]. The bytes come back via `Isolate.exit`, which hands
+/// [hashFileInIsolate]. The bytes come back via `Isolate.exit`, which hands
 /// the buffer over rather than copying it.
 Future<(Uint8List, String)> _readAndHashChunkInIsolate(
     String path, int offset, int length) {
@@ -369,7 +356,7 @@ class InstanceApiService {
     final cached = _zipHashCache[cacheKey];
     if (cached != null) return cached;
 
-    final digest = await _hashFileInIsolate(file.path);
+    final digest = await hashFileInIsolate(file.path);
     _zipHashCache[cacheKey] = digest;
     return digest;
   }
@@ -423,6 +410,7 @@ class InstanceApiService {
         name: archive['name'] as String,
         size: (archive['size'] as num?)?.toInt() ?? 0,
         isArchive: true,
+        sha256: archive['sha256'] as String?,
       ));
     } else {
       for (final f in (data['files'] as List? ?? [])) {
@@ -430,6 +418,7 @@ class InstanceApiService {
           files.add(OutputFileInfo(
             name: f['name'] as String,
             size: (f['size'] as num?)?.toInt() ?? 0,
+            sha256: f['sha256'] as String?,
           ));
         }
       }

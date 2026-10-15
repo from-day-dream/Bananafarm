@@ -11,6 +11,9 @@ class JobProgressDisplay extends StatelessWidget {
   /// Total number of frames to render
   final int totalFrames;
 
+  /// Number of frames fully rendered
+  final int framesDone;
+
   /// Status message (e.g., "Rendering frame 45/250")
   final String statusMessage;
 
@@ -36,6 +39,7 @@ class JobProgressDisplay extends StatelessWidget {
     required this.percentage,
     required this.currentFrame,
     required this.totalFrames,
+    this.framesDone = 0,
     required this.statusMessage,
     this.error,
     this.loading = false,
@@ -183,8 +187,10 @@ class JobProgressDisplay extends StatelessWidget {
       }
       return '${percentage.toStringAsFixed(1)}%';
     }
-    return totalFrames > 0
-        ? 'Frame $currentFrame / $totalFrames'
+    // currentFrame is Blender's frame number, which need not start at 1, so
+    // the count against the total uses framesDone instead.
+    return totalFrames > 0 && currentFrame > 0
+        ? 'Frame $currentFrame · $framesDone/$totalFrames done'
         : 'Preparing...';
   }
 

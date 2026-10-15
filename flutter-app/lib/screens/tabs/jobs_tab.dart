@@ -184,7 +184,7 @@ class JobsTab extends ConsumerWidget {
           children: [
             Expanded(
               child: Text(
-                job.originalFilename,
+                job.displayName,
                 style: const TextStyle(fontWeight: FontWeight.bold),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,

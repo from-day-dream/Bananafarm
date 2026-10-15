@@ -27,8 +27,9 @@ class ProviderApiException implements Exception {
 abstract class GpuProviderService {
   RenderProvider get provider;
 
-  /// Live list of GPUs the provider currently offers, with prices.
-  Future<List<GpuOffer>> listGpus();
+  /// Live list of GPUs the provider currently offers. Prices are $/hr
+  /// including [diskGb] of instance storage.
+  Future<List<GpuOffer>> listGpus({required int diskGb});
 
   /// Rent an instance running [InstanceRequest.dockerImage] with the render
   /// job's environment variables injected.
@@ -39,6 +40,17 @@ abstract class GpuProviderService {
 
   /// Destroy the instance. Idempotent: a missing instance (404) is success.
   Future<void> destroyInstance(String instanceId, {String? instanceName});
+
+  /// The account's remaining balance with this provider.
+  Future<ProviderBalance> getBalance();
+
+  /// The last [tail] lines of the instance's [source] log, oldest first.
+  Future<String> getLogs(
+    String instanceId, {
+    required InstanceLogSource source,
+    int tail = 1000,
+    String? instanceName,
+  });
 
   /// Environment variables shared by every provider's container config.
   static Map<String, String> containerEnv(InstanceRequest request) {

@@ -59,6 +59,13 @@ class DraftJobNotifier extends StateNotifier<List<DraftJob>> {
     return jobId;
   }
 
+  /// Put back a draft rebuilt from an existing job (Retry, or a stuck start
+  /// sent back to GPU selection). Replaces any draft with the same id.
+  Future<void> restoreDraft(DraftJob draft) async {
+    await _localStorage.saveDraftJob(draft);
+    state = [...state.where((d) => d.id != draft.id), draft];
+  }
+
   /// Update a draft job's GPU selection
   Future<void> selectGPUForJob(String jobId, dynamic selectedGpu) async {
     final index = state.indexWhere((j) => j.id == jobId);
@@ -80,6 +87,27 @@ class DraftJobNotifier extends StateNotifier<List<DraftJob>> {
     updatedJob.errorMessage = null; // Clear any previous errors
 
     await _localStorage.saveDraftJob(updatedJob);
+    state = [...state];
+  }
+
+  /// Rename a draft. The name travels in renderParams['job_name'], so it
+  /// carries over to the RenderJob, retries and the download folder.
+  Future<void> renameJob(String jobId, String name) async {
+    final index = state.indexWhere((j) => j.id == jobId);
+    if (index == -1) return;
+
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return;
+
+    final job = state[index];
+    if (job.status == DraftJobStatus.zipping) {
+      print('⚠️ Cannot rename job ${job.originalFilename} while zipping');
+      return;
+    }
+    if (job.renderParams['job_name'] == trimmed) return;
+
+    job.renderParams['job_name'] = trimmed;
+    await _localStorage.saveDraftJob(job);
     state = [...state];
   }
 

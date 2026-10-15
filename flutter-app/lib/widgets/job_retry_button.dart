@@ -4,9 +4,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/job_model.dart';
 import 'job_retry_action.dart';
 
-/// Re-runs a failed job, on the same GPU or a different one.
+/// Retries a failed or cancelled job via the submission page.
 ///
-/// Deliberately never disappears for a failed job: when the project files have
+/// Deliberately never disappears for such a job: when the project files have
 /// been reclaimed it renders disabled with the reason, because a retry button
 /// that silently isn't there reads as "this app has no retry".
 class JobRetryButton extends ConsumerStatefulWidget {
@@ -28,8 +28,7 @@ class _JobRetryButtonState extends ConsumerState<JobRetryButton> {
   Widget build(BuildContext context) {
     final job = widget.job;
 
-    // Only failed jobs are retryable — cancelled is a deliberate user action.
-    if (!job.isFailed) {
+    if (!job.isFailed && !job.isCancelled) {
       return const SizedBox.shrink();
     }
 
@@ -43,7 +42,7 @@ class _JobRetryButtonState extends ConsumerState<JobRetryButton> {
       );
     }
 
-    if (!job.canRepickGpu) {
+    if (!job.canRetry) {
       return Tooltip(
         message: 'Project files were reclaimed — resend the job from Blender',
         child: _box(

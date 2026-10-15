@@ -14,6 +14,7 @@ Features:
 import subprocess
 import re
 import os
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 
@@ -25,6 +26,7 @@ class RenderProgress:
         self.progress_percent = 0.0
         self.current_frame = 0
         self.total_frames = 1
+        self.frames_done = 0
         self.current_sample = 0
         self.total_samples = 0
         self.tiles_done = 0
@@ -39,6 +41,7 @@ class RenderProgress:
             'progress_percent': round(self.progress_percent, 2),
             'current_frame': self.current_frame,
             'total_frames': self.total_frames,
+            'frames_done': self.frames_done,
             'current_sample': self.current_sample,
             'total_samples': self.total_samples,
             'tiles_done': self.tiles_done,
@@ -213,7 +216,9 @@ class RenderExecutor:
         script_paths = [
             "/app/src/hardware_config.py",
             "/app/src/gpu_monitor.py",
-            "/app/src/enable_persistent_data.py"
+            "/app/src/enable_persistent_data.py",
+            # Frame start/done events for progress; see _parse_progress_line
+            "/app/src/progress_reporter.py",
         ]
 
         for script in script_paths:
@@ -281,7 +286,7 @@ class RenderExecutor:
                         log_buffer.pop(0)
 
                 # Parse progress from Blender output
-                self._parse_progress_line(
+                changed = self._parse_progress_line(
                     line=line,
                     is_animation_render=is_animation_render,
                     frame_start=frame_start,
@@ -290,8 +295,8 @@ class RenderExecutor:
                     total_frames=total_frames
                 )
 
-                # Call progress callback if progress updated
-                if progress_callback and self.progress.progress_percent > 0:
+                # Publish every change, including the first frame starting at 0%
+                if progress_callback and changed:
                     progress_callback(self.progress)
 
             process.wait()
@@ -326,104 +331,84 @@ class RenderExecutor:
             self.progress.error_message = str(e)
             return False
 
+    # Per-frame sample counters. Cycles prints "Sample 8/128" and EEVEE prints
+    # "Rendering 25 / 64 samples"; both tolerate the spacing changes Blender 5
+    # made to its log lines.
+    _SAMPLE_PATTERNS = (
+        re.compile(r'Sample\s+(\d+)\s*/\s*(\d+)'),
+        re.compile(r'Rendering\s+(\d+)\s*/\s*(\d+)\s+samples'),
+    )
+    _EVENT_MARKER = "BANANAFARM_PROGRESS "
+
     def _parse_progress_line(self, line: str, is_animation_render: bool,
                             frame_start: int, frame_end: int,
-                            current_frame: int, total_frames: int):
-        """Parse a single line of Blender output for progress information"""
+                            current_frame: int, total_frames: int) -> bool:
+        """Update progress from one line of Blender output.
 
-        # Animation frame progress (e.g., "Fra:10 Mem:10.53M ...")
-        frame_match = re.search(r'Fra:(\d+)', line)
-        if is_animation_render and frame_match and total_frames > 0:
-            frame_num = int(frame_match.group(1))
-            self.progress.current_frame = frame_num
-            self.progress.progress_percent = ((frame_num - frame_start) / total_frames) * 100.0
-            self.progress.status_message = f"Rendering frame {frame_num}/{frame_end}"
-            return
+        Frames come from progress_reporter.py's structured events, which fire
+        for every engine and output type. Samples only refine progress within
+        the current frame. Returns True when the progress changed.
+        """
+        progress = self.progress
+        total = max(total_frames, 1)
 
-        # Tiled rendering progress (e.g., "Rendered 0/4 Tiles, Sample 65/128")
-        # Note: 0/4 tiles means 4 tiles done? No, standard Blender output format usually implies X done out of Y total.
-        # Wait, the user provided example: "Rendered 0/4 Tiles". 
-        # Typically "Rendered X/Y Tiles" means X completed out of Y total tasks? 
-        # Actually Blender Cycles often splits into tiles. 
-        # Let's handle the specific format: "Rendered 0/4 Tiles, Sample 65/128"
-        # Since it's 0-indexed or "completed" count? "0/4 Tiles" implies 0 completed.
-        
-        tile_match = re.search(r'Rendered (\d+)/(\d+) Tiles', line)
-        sample_match = re.search(r'Sample (\d+)/(\d+)', line)
-        
-        if not is_animation_render and tile_match and sample_match:
-            tiles_done = int(tile_match.group(1))
-            total_tiles = int(tile_match.group(2)) # This is often "remaining" + "done" or just total? 
-            # In Blender "Rendered 0/4 Tiles" usually means 4 total tiles, 0 fully completed.
-            # But the user logs say "0/4 Tiles", so let's assume denominator is total count.
-            # Wait, user log: "Rendered 0/4 Tiles". 
-            # If total_tiles is 4, then each tile is 25%.
-            
-            # User logic: "0/4 tiles would mean 4+1 total tiles" -> wait, user said "0/4 tiles would mean 4+1 total tiles".
-            # That sounds specific. Let's look closer at the user prompt: "0/4 tiles would mean 4+1 total tiles, so 100% would be 100/5 = 20%".
-            # Why 4+1? Maybe "0/4" means tile index 0 out of 4 (so 0,1,2,3,4 = 5 tiles)?
-            # Or maybe "0/4" means 0 completed, 4 remaining?
-            # Standard Blender output "Rendered X/Y Tiles" usually means X completed, Y TOTAL.
-            # But let's trust the user's interpretation if they are sure, OR stick to standard interpretation if user is guessing.
-            # User text: "0/4 tiles would mean 4+1 total tiles" logic seems to imply 0-4 indices?
-            # Actually, standard Blender 3.0+ cycles often just says "Sample X/Y". 
-            # With tiling, it says "Rendered X/Y Tiles".
-            # Let's assume the user wants: Total Tiles = Denominator + 1? Or just Denominator?
-            # User said: "0/4 tiles would mean 4+1 total tiles".
-            # If log says "Rendered 4/4 Tiles", is it done?
-            # Let's assume Denominator is just total tiles for now, unless user logic is strictly "index".
-            # Actually, "Rendered 0/4" -> 4 total tiles.
-            # Let's use the user's specific formula logic if possible:
-            # "so 100% would be 100/5 = 20%". This implies 5 total tiles.
-            # So Total = Denominator + 1. 
-            
-            # Let's follow user direction: "0/4 tiles would mean 4+1 total tiles".
-            # It seems they interpret "4" as the max index? Or "remaining"?
-            # Actually, usually "Rendered 0/4" means 0 done, 4 total.
-            # IF the user is seeing "0/4" and thinks it implies 5 tiles, maybe they are seeing index?
-            # But "Rendered" implies count.
-            # I will use the parsed numbers. 
-            # If user logic is "0/4 means 5 total", I will implement total = Y + 1.
-            
-            total_tiles_derived = int(tile_match.group(2)) + 1
-            tiles_done = int(tile_match.group(1))
-            
-            current_sample = int(sample_match.group(1))
-            total_samples = int(sample_match.group(2))
-            
-            if total_tiles_derived > 0 and total_samples > 0:
-                self.progress.tiles_done = tiles_done
-                self.progress.total_tiles = total_tiles_derived
-                
-                self.progress.current_sample = current_sample
-                self.progress.total_samples = total_samples
-                
-                # Formula: ((tiles_done * 100) / total_tiles) + ((current_sample * (100/total_tiles)) / total_samples)
-                # Simplified: (tiles_done + (current_sample / total_samples)) / total_tiles * 100
-                
-                percent_per_tile = 100.0 / total_tiles_derived
-                current_tile_progress = (current_sample / total_samples) * percent_per_tile
-                total_progress = (tiles_done * percent_per_tile) + current_tile_progress
-                
-                self.progress.progress_percent = total_progress
-                self.progress.status_message = f"Rendering frame {current_frame} (Tile {tiles_done}/{total_tiles_derived-1}, Sample {current_sample}/{total_samples})"
-                return
+        marker_at = line.find(self._EVENT_MARKER)
+        if marker_at != -1:
+            try:
+                event = json.loads(line[marker_at + len(self._EVENT_MARKER):])
+            except ValueError:
+                return False
 
-        # Fallback for non-tiled single frame (e.g., "Sample 16/128")
-        if not is_animation_render and sample_match:
-            current_sample = int(sample_match.group(1))
-            total_samples = int(sample_match.group(2))
+            kind = event.get("event")
+            frame = event.get("frame", progress.current_frame)
+            if kind == "frame_start":
+                progress.current_frame = frame
+                progress.current_sample = 0
+                progress.total_samples = 0
+            elif kind == "frame_done":
+                progress.frames_done = min(progress.frames_done + 1, total)
+                progress.current_sample = 0
+            else:
+                return False
 
-            if total_samples > 0:
-                self.progress.current_sample = current_sample
-                self.progress.total_samples = total_samples
-                self.progress.progress_percent = (current_sample / total_samples) * 100.0
-                self.progress.status_message = f"Rendering frame {current_frame} (Sample {current_sample}/{total_samples})"
-                return
+            self._update_percent(total)
+            index = min(progress.frames_done + (1 if kind == "frame_start" else 0), total)
+            counter = f" ({index}/{total})" if total > 1 else ""
+            verb = "Rendering" if kind == "frame_start" else "Finished"
+            progress.status_message = f"{verb} frame {frame}{counter}"
+            return True
+
+        for pattern in self._SAMPLE_PATTERNS:
+            match = pattern.search(line)
+            if not match:
+                continue
+            current_sample, total_samples = int(match.group(1)), int(match.group(2))
+            if total_samples <= 0:
+                return False
+            progress.current_sample = min(current_sample, total_samples)
+            progress.total_samples = total_samples
+            self._update_percent(total)
+            frame_label = progress.current_frame or current_frame
+            index = min(progress.frames_done + 1, total)
+            prefix = f"Rendering frame {frame_label} ({index}/{total})" if total > 1 else f"Rendering frame {frame_label}"
+            progress.status_message = f"{prefix} - Sample {progress.current_sample}/{total_samples}"
+            return True
 
         # Error detection
         if "Error:" in line or "ERROR" in line:
-            self.progress.error_message = line
+            progress.error_message = line
+
+        return False
+
+    def _update_percent(self, total_frames: int):
+        """One formula for every output: whole frames plus the current frame's
+        sample fraction. Held below 100 until execute_render reports success."""
+        progress = self.progress
+        fraction = 0.0
+        if progress.total_samples > 0 and progress.frames_done < total_frames:
+            fraction = progress.current_sample / progress.total_samples
+        percent = (progress.frames_done + fraction) / total_frames * 100.0
+        progress.progress_percent = min(percent, 99.9)
 
     def get_output_files(self) -> List[str]:
         """

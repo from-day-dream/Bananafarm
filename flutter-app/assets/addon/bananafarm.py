@@ -32,6 +32,7 @@ import urllib.error
 import uuid
 import shutil
 import subprocess
+import traceback
 from bpy.props import (
     StringProperty,
     CollectionProperty,
@@ -111,9 +112,16 @@ class SceneProperties(PropertyGroup):
         default='OPTIX'
     )
 
-    # ---- Submit progress -------------------------------------------------
-    # The panel can't see operator instance state, so the running submit
-    # publishes its phase here and the panel reads it back out.
+
+class SubmitProgress(PropertyGroup):
+    """Live state of the in-flight submit.
+
+    The panel can't see operator instance state, so the running submit
+    publishes its phase here and the panel reads it back out. Registered on
+    the WindowManager, not the Scene: scene properties are saved into the
+    .blend, and the submit saves the file mid-flight — a file closed after
+    that would reopen stuck on "Saving project..." with Submit greyed out.
+    """
     job_running: BoolProperty(
         name="Job Running",
         description="True while a submit is in flight",
@@ -171,7 +179,7 @@ def set_progress(context, phase):
     whatever it drew last, so the bar would look frozen.
     """
     label, factor = phase
-    props = context.scene.bar_props
+    props = context.window_manager.bar_progress
     props.job_running = True
     props.job_status = label
     props.job_progress = factor
@@ -186,7 +194,7 @@ def set_progress(context, phase):
 def clear_progress(context):
     """Hide the progress bar once a submit ends, successfully or not."""
     try:
-        props = context.scene.bar_props
+        props = context.window_manager.bar_progress
     except (AttributeError, KeyError):
         return
     props.job_running = False
@@ -321,6 +329,7 @@ class BAR_OT_SubmitRenderJob(Operator):
     _log_file = None
     _log_path = ""
     _video_promoted = False
+    _packing_started = 0.0
 
     def invoke(self, context, event):
         """Prompt before submitting if the scene has unpacked external assets.
@@ -369,12 +378,35 @@ class BAR_OT_SubmitRenderJob(Operator):
         op.pack_mode = 'SKIP'
 
     def modal(self, context, event):
+        # Esc cancels a pack that is taking too long or has hung. Only during
+        # packing: once transferring, the app may already be zipping the temp
+        # folder, so pulling it out from under it would be worse than waiting
+        # out the request's own timeout.
+        if event.type == 'ESC' and event.value == 'PRESS' and self._step == "packing":
+            if self._subprocess and self._subprocess.poll() is None:
+                self._subprocess.terminate()
+                try:
+                    self._subprocess.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._subprocess.kill()
+            print("Submit cancelled during packing.")
+            self.cleanup(context, remove_temp=True)
+            self.report({'WARNING'}, "Submit cancelled")
+            return {'CANCELLED'}
+
         # The state check only ever advances on a timer tick; without this gate
         # it re-runs on every mouse move.
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
         if self._step == "packing":
+            # Repaint with elapsed time each tick, so a slow pack visibly keeps
+            # moving instead of looking frozen on an earlier phase.
+            if self._subprocess and self._subprocess.poll() is None:
+                elapsed = int(time.time() - self._packing_started)
+                label, factor = PHASE_PACKING
+                set_progress(context, (f"{label} ({elapsed}s, Esc to cancel)", factor))
+
             # Check if subprocess is finished
             if self._subprocess and self._subprocess.poll() is not None:
                 # Process finished
@@ -450,19 +482,22 @@ class BAR_OT_SubmitRenderJob(Operator):
         wm.modal_handler_add(self)
         set_progress(context, PHASE_SAVING)
 
-        # 4. Create temp directory
-        filename = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-        # Sanitize filename
-        filename = "".join([c for c in filename if c.isalpha() or c.isdigit() or c==' ' or c=='_']).strip().replace(' ', '_')
-        if not filename: filename = "project"
-
-        unique_id = uuid.uuid4().hex[:8]
-        self._temp_dir = os.path.join(temp_root, f"{filename}_{unique_id}")
-        os.makedirs(self._temp_dir, exist_ok=True)
-        print(f"Created temp dir: {self._temp_dir}")
-
-        # 5. Save/Copy current file to temp
+        # Everything from here on runs with the progress bar showing, so any
+        # failure must go through cleanup — an exception that escapes leaves
+        # the bar stuck on "Saving project..." with no visible error.
         try:
+            # 4. Create temp directory
+            filename = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+            # Sanitize filename
+            filename = "".join([c for c in filename if c.isalpha() or c.isdigit() or c==' ' or c=='_']).strip().replace(' ', '_')
+            if not filename: filename = "project"
+
+            unique_id = uuid.uuid4().hex[:8]
+            self._temp_dir = os.path.join(temp_root, f"{filename}_{unique_id}")
+            os.makedirs(self._temp_dir, exist_ok=True)
+            print(f"Created temp dir: {self._temp_dir}")
+
+            # 5. Save the current file; the packer reads it from disk
             # Check and correct resolution to be divisible by 2 (required for video encoding)
             render = context.scene.render
             if render.resolution_x % 2 != 0:
@@ -489,13 +524,14 @@ class BAR_OT_SubmitRenderJob(Operator):
             # The packer writes the finished scene.blend into temp itself.
             self._project_file = bpy.data.filepath
 
-        except Exception as e:
-            show_message_box(f"Failed to prepare project files: {str(e)}", "File Error", "ERROR")
-            self.cleanup(context, remove_temp=True)
-            return {'FINISHED'}
+            # 6. Generate and Run Packer Script
+            self.run_packer_subprocess(context)
 
-        # 6. Generate and Run Packer Script
-        self.run_packer_subprocess(context)
+        except Exception as e:
+            traceback.print_exc()
+            show_message_box(f"Submit failed: {e}", "Submit Error", "ERROR")
+            self.cleanup(context, remove_temp=True)
+            return {'CANCELLED'}
 
         return {'RUNNING_MODAL'}
 
@@ -667,10 +703,14 @@ if __name__ == "__main__":
         
         # Run Blender in background
         blender_bin = bpy.app.binary_path
-        cmd = [blender_bin, "-b", self._project_file, "-P", packer_script_path]
+        # --disable-autoexec: the packer only packs and saves, so the file's
+        # own auto-run scripts must not run — one that loops or waits would
+        # keep this background process alive forever.
+        cmd = [blender_bin, "-b", "--disable-autoexec", self._project_file, "-P", packer_script_path]
         
         print(f"Starting packer process: {' '.join(cmd)}")
         self._step = "packing"
+        self._packing_started = time.time()
         set_progress(context, PHASE_PACKING)
 
         # Log to a file rather than PIPE. With PIPE, nothing drains the stream
@@ -820,6 +860,7 @@ class BAR_PT_MainPanel(Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.bar_props
+        progress = context.window_manager.bar_progress
 
         # Settings
         box = layout.box()
@@ -837,14 +878,14 @@ class BAR_PT_MainPanel(Panel):
         col.prop(props, "cycles_device_override", text="Device")
 
         row = col.row(align=True)
-        row.enabled = not props.job_running
+        row.enabled = not progress.job_running
         row.operator("bar.submit_render_job", text="Submit Still", icon='RENDER_STILL').is_animation_job = False
         row.operator("bar.submit_render_job", text="Submit Animation", icon='RENDER_ANIMATION').is_animation_job = True
 
         # Live progress for the in-flight submit
-        if props.job_running:
+        if progress.job_running:
             col.separator()
-            col.progress(factor=props.job_progress, text=props.job_status)
+            col.progress(factor=progress.job_progress, text=progress.job_status)
 
 # ###########################################################################
 #
@@ -854,6 +895,7 @@ class BAR_PT_MainPanel(Panel):
 
 classes = [
     SceneProperties,
+    SubmitProgress,
     BAR_OT_SubmitRenderJob,
     BAR_PT_MainPanel,
 ]
@@ -863,12 +905,14 @@ def register():
         bpy.utils.register_class(cls)
     
     bpy.types.Scene.bar_props = PointerProperty(type=SceneProperties)
+    bpy.types.WindowManager.bar_progress = PointerProperty(type=SubmitProgress)
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    
+
     del bpy.types.Scene.bar_props
+    del bpy.types.WindowManager.bar_progress
 
 if __name__ == "__main__":
     register()

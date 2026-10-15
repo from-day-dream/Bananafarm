@@ -78,7 +78,9 @@ class LiveJobProgressDisplay extends StatelessWidget {
     return JobProgressDisplay(
       percentage: percentage,
       currentFrame: progress?.currentFrame ?? 0,
-      totalFrames: progress?.totalFrames ?? job.renderParams.frameEnd,
+      totalFrames: progress?.totalFrames ??
+          (job.renderParams.frameEnd - job.renderParams.frameStart + 1),
+      framesDone: progress?.framesDone ?? 0,
       statusMessage: statusMessage,
       loading: isWarmingUp,
       isAnimation: job.renderParams.isAnimationRender,

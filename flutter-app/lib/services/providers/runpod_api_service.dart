@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:dio/dio.dart';
 
 import '../../models/gpu_offer.dart';
@@ -14,6 +17,13 @@ import 'gpu_provider_service.dart';
 class RunpodApiService implements GpuProviderService {
   static const _restUrl = 'https://rest.runpod.io/v1';
   static const _graphqlUrl = 'https://api.runpod.io/graphql';
+  static const _logsUrl = 'https://api.runpod.io/v2/pods';
+
+  /// The log endpoint is a live SSE stream that never ends by itself. The
+  /// backfill arrives in a burst, so stop once the stream goes quiet — or at
+  /// the hard cap if a busy container keeps it chattering.
+  static const _logQuietPeriod = Duration(milliseconds: 1500);
+  static const _logMaxWait = Duration(seconds: 8);
 
   final String apiKey;
   @override
@@ -34,13 +44,17 @@ class RunpodApiService implements GpuProviderService {
 
   bool get _secureCloud => provider == RenderProvider.runpodSecure;
 
+  /// Container disk is billed at $0.10/GB/month while the pod runs; RunPod's
+  /// GPU prices leave it out, so it is added to every rate shown.
+  static double storagePerHour(int diskGb) => diskGb * 0.10 / 730;
+
   Map<String, String> get _headers => {
         'Authorization': 'Bearer $apiKey',
         'Content-Type': 'application/json',
       };
 
   @override
-  Future<List<GpuOffer>> listGpus() async {
+  Future<List<GpuOffer>> listGpus({required int diskGb}) async {
     // One query covers the whole catalog: prices per marketplace plus a
     // stock signal for this marketplace's cloud.
     final query = '''
@@ -90,7 +104,7 @@ class RunpodApiService implements GpuProviderService {
         provider: provider,
         gpuName: (gpu['displayName'] as String?) ?? (gpu['id'] as String? ?? ''),
         gpuId: gpu['id'] as String? ?? '',
-        pricePerHour: price,
+        pricePerHour: price + storagePerHour(diskGb),
         memoryGb: (gpu['memoryInGb'] as num?)?.round(),
         stockStatus: gpu['lowestPrice']?['stockStatus'] as String?,
       ));
@@ -112,7 +126,7 @@ class RunpodApiService implements GpuProviderService {
       'interruptible': false,
       'gpuTypeIds': [request.gpu.gpuId],
       'gpuTypePriority': 'availability',
-      'containerDiskInGb': 60,
+      'containerDiskInGb': request.diskGb,
       'volumeInGb': 0,
       'minVCPUPerGPU': 8,
       'minRAMPerGPU': 16,
@@ -157,18 +171,136 @@ class RunpodApiService implements GpuProviderService {
 
     final data = response.data;
     final status = (data is Map ? data['desiredStatus'] as String? : null) ?? '';
+    final rate = data is Map ? _podRate(data) : null;
     switch (status.toUpperCase()) {
       case 'RUNNING':
         return InstanceStatus(
           state: ProviderInstanceState.running,
           endpoint: 'https://$instanceId-8000.proxy.runpod.net',
+          pricePerHour: rate,
         );
       case 'EXITED':
       case 'TERMINATED':
-        return InstanceStatus(state: ProviderInstanceState.stopped);
+        return InstanceStatus(
+            state: ProviderInstanceState.stopped, pricePerHour: rate);
       default:
-        return InstanceStatus(state: ProviderInstanceState.pending);
+        return InstanceStatus(
+            state: ProviderInstanceState.pending, pricePerHour: rate);
     }
+  }
+
+  /// The pod's GPU rate plus its container disk, when the response has it.
+  double? _podRate(Map data) {
+    // adjustedCostPerHr is what is actually billed after Savings Plans.
+    final gpuRate = num.tryParse(
+            '${data['adjustedCostPerHr'] ?? data['costPerHr'] ?? ''}')
+        ?.toDouble();
+    if (gpuRate == null || gpuRate <= 0) return null;
+    final diskGb = (data['containerDiskInGb'] as num?)?.toInt() ?? 0;
+    return gpuRate + storagePerHour(diskGb);
+  }
+
+  @override
+  Future<String> getLogs(
+    String instanceId, {
+    required InstanceLogSource source,
+    int tail = 1000,
+    String? instanceName,
+  }) async {
+    final cancel = CancelToken();
+    final Response<ResponseBody> response;
+    try {
+      response = await _dio.get<ResponseBody>(
+        '$_logsUrl/$instanceId/logs',
+        queryParameters: {
+          'source': source == InstanceLogSource.system ? 'system' : 'container',
+          'tail': tail.clamp(0, 5000),
+        },
+        options: Options(
+          headers: {..._headers, 'Accept': 'text/event-stream'},
+          responseType: ResponseType.stream,
+        ),
+        cancelToken: cancel,
+      );
+    } on DioException catch (e) {
+      throw _wrap(e);
+    }
+
+    final lines = <String>[];
+    final done = Completer<void>();
+    Timer? quiet;
+    void finish() {
+      if (!done.isCompleted) done.complete();
+    }
+
+    void restartQuietTimer() {
+      quiet?.cancel();
+      quiet = Timer(_logQuietPeriod, finish);
+    }
+
+    final subscription = response.data!.stream
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(
+      (raw) {
+        restartQuietTimer();
+        final line = _sseLogLine(raw);
+        if (line != null) lines.add(line);
+      },
+      onError: (_) => finish(),
+      onDone: finish,
+      cancelOnError: true,
+    );
+    restartQuietTimer();
+    final hardStop = Timer(_logMaxWait, finish);
+
+    await done.future;
+    quiet?.cancel();
+    hardStop.cancel();
+    await subscription.cancel();
+    cancel.cancel();
+    return lines.join('\n');
+  }
+
+  /// The log text of one SSE line, or null for ids, comments, heartbeats and
+  /// anything that isn't a log event.
+  static String? _sseLogLine(String raw) {
+    if (!raw.startsWith('data:')) return null;
+    final payload = raw.substring(5).trim();
+    if (payload.isEmpty) return null;
+    try {
+      final event = jsonDecode(payload);
+      if (event is Map && event['line'] != null) return '${event['line']}';
+    } on FormatException {
+      return payload;
+    }
+    return null;
+  }
+
+  @override
+  Future<ProviderBalance> getBalance() async {
+    final response = await _request(
+      () => _dio.post(
+        _graphqlUrl,
+        data: {'query': 'query { myself { clientBalance currentSpendPerHr } }'},
+        options: Options(headers: _headers),
+      ),
+    );
+    final data = response.data;
+    if (data is Map && data['errors'] != null) {
+      throw ProviderApiException(provider, data['errors'].toString());
+    }
+    final myself = data is Map ? (data['data']?['myself']) : null;
+    final balance = myself is Map ? myself['clientBalance'] : null;
+    if (balance is! num) {
+      throw ProviderApiException(
+          provider, 'Unexpected account response: ${response.data}');
+    }
+    return ProviderBalance(
+      balance: balance.toDouble(),
+      spendPerHour: (myself['currentSpendPerHr'] as num?)?.toDouble(),
+    );
   }
 
   @override
