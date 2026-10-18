@@ -94,7 +94,7 @@ class _MainLayoutScreenState extends ConsumerState<MainLayoutScreen> {
                   Container(
                     decoration: BoxDecoration(
                       color: isDark
-                          ? const Color(0xFF1E1E1E)
+                          ? AppTheme.darkSurface
                           : Colors.grey[100],
                       borderRadius: BorderRadius.circular(30),
                     ),

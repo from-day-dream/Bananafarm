@@ -77,6 +77,46 @@ def fetch_temp_root(port):
     os.makedirs(temp_root, exist_ok=True)
     return temp_root
 
+# ---------------------------------------------------------------------------
+# Presence heartbeat.
+#
+# The addon normally only talks to the app during a submit, so the app has no
+# way to tell whether Blender is running. This daemon thread pings the app's
+# /addon-ping endpoint at a slow interval so the dashboard "Active" badge
+# reflects real addon presence. It sleeps between pings — no busy loop — and
+# never touches bpy data from the background thread; the port it uses is
+# synced from the panel's draw() (main thread) into _heartbeat_port.
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_INTERVAL = 15.0  # seconds between pings
+
+_heartbeat_stop = threading.Event()
+_heartbeat_port = 47288
+
+
+def _heartbeat_loop():
+    while not _heartbeat_stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            with urllib.request.urlopen(
+                f"http://localhost:{_heartbeat_port}/addon-ping", timeout=3
+            ) as response:
+                response.read()
+        except Exception:
+            # App not running, wrong port, whatever — stay silent and retry
+            # on the next tick. Heartbeats must never surface as errors.
+            pass
+
+
+def _start_heartbeat():
+    """(Re)start the heartbeat thread, stopping any thread from a previous
+    registration so reloading the addon never leaks a second loop."""
+    global _heartbeat_stop
+    _heartbeat_stop.set()
+    _heartbeat_stop = threading.Event()
+    threading.Thread(
+        target=_heartbeat_loop, daemon=True, name="banana-farm-heartbeat"
+    ).start()
+
 # ###########################################################################
 #
 #                         PROPERTY GROUP DEFINITIONS
@@ -862,6 +902,11 @@ class BAR_PT_MainPanel(Panel):
         props = context.scene.bar_props
         progress = context.window_manager.bar_progress
 
+        # Keep the heartbeat thread's target port in sync with the user's
+        # setting. draw() runs on the main thread, so this is a safe place.
+        global _heartbeat_port
+        _heartbeat_port = props.server_port
+
         # Settings
         box = layout.box()
         box.label(text="Settings", icon='PREFERENCES')
@@ -903,9 +948,11 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
     bpy.types.Scene.bar_props = PointerProperty(type=SceneProperties)
     bpy.types.WindowManager.bar_progress = PointerProperty(type=SubmitProgress)
+
+    _start_heartbeat()
 
 def unregister():
     for cls in reversed(classes):
@@ -913,6 +960,8 @@ def unregister():
 
     del bpy.types.Scene.bar_props
     del bpy.types.WindowManager.bar_progress
+
+    _heartbeat_stop.set()
 
 if __name__ == "__main__":
     register()

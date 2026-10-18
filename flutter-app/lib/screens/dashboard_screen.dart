@@ -128,12 +128,12 @@ class DashboardScreen extends ConsumerWidget {
                     vertical: 6,
                   ),
                   decoration: BoxDecoration(
-                    color: addonStatus.isServerRunning
+                    color: addonStatus.isConnected
                         ? Colors.green.withOpacity(0.1)
                         : Colors.red.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(20),
                     border: Border.all(
-                      color: addonStatus.isServerRunning
+                      color: addonStatus.isConnected
                           ? Colors.green
                           : Colors.red,
                     ),
@@ -146,18 +146,18 @@ class DashboardScreen extends ConsumerWidget {
                         height: 6,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: addonStatus.isServerRunning
+                          color: addonStatus.isConnected
                               ? Colors.green
                               : Colors.red,
                         ),
                       ),
                       const SizedBox(width: 6),
                       Text(
-                        addonStatus.isServerRunning ? 'Active' : 'Inactive',
+                        addonStatus.isConnected ? 'Active' : 'Inactive',
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.bold,
-                          color: addonStatus.isServerRunning
+                          color: addonStatus.isConnected
                               ? Colors.green
                               : Colors.red,
                         ),

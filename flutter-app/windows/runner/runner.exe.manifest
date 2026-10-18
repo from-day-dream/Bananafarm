@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd4a36a3a0}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f6e5f7a-b400-4b6e-bc06-c1a4a1b6b9e9}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e4-2bb0-4f1f-a5e2-9c1a2d4a1b6b}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-0d8e-4c34-8ea7-cb1c5c9b1b7c}"/>
+    </application>
+  </compatibility>
+</assembly>
