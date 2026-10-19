@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart' as rp;
 import 'package:uuid/uuid.dart';
+import 'dart:async';
 import 'dart:io';
 import 'package:path/path.dart' as p;
 import '../services/addon_service.dart';
@@ -40,9 +41,22 @@ String _orDefaultBlenderVersion(String? reported) {
   return v.isEmpty ? AppConstants.defaultBlenderVersion : v;
 }
 
+/// How long after the addon's last sign of life it still counts as connected.
+///
+/// The addon heartbeats every 15 s, so this rides out three missed beats
+/// (Blender busy rendering, machine briefly loaded) before the badge flips.
+const Duration addonPresenceWindow = Duration(seconds: 45);
+
+/// Whether the addon counts as connected, given the last time it made itself
+/// known to the app. Pure so the freshness rule is unit-testable.
+bool addonSeenRecently(DateTime? lastSeenAt, {DateTime? now}) {
+  final at = now ?? DateTime.now();
+  return lastSeenAt != null && at.difference(lastSeenAt) < addonPresenceWindow;
+}
+
 class AddonConnectionState {
   final bool isServerRunning;
-  final bool isConnected; // Only true when addon actually sends a job
+  final bool isConnected; // True while the addon has made itself known recently
   final int port;
   final String? lastError;
   final DateTime? lastJobReceivedAt;
@@ -60,13 +74,15 @@ class AddonConnectionState {
     bool? isConnected,
     int? port,
     String? lastError,
+    bool clearLastError = false,
     DateTime? lastJobReceivedAt,
   }) {
     return AddonConnectionState(
       isServerRunning: isServerRunning ?? this.isServerRunning,
       isConnected: isConnected ?? this.isConnected,
       port: port ?? this.port,
-      lastError: lastError ?? this.lastError,
+      // copyWith(null) can't express "clear", hence the explicit flag.
+      lastError: clearLastError ? null : (lastError ?? this.lastError),
       lastJobReceivedAt: lastJobReceivedAt ?? this.lastJobReceivedAt,
     );
   }
@@ -95,6 +111,12 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
   final AddonService _addonService;
   final rp.Ref _ref;
 
+  /// Re-checks heartbeat freshness. Cheap by design: one comparison per tick,
+  /// and state is only written when the connected flag actually changes, so
+  /// watching widgets don't rebuild every tick.
+  static const _presenceCheckInterval = Duration(seconds: 10);
+  Timer? _presenceTimer;
+
   AddonConnectionNotifier(this._addonService, this._ref)
     : super(
         AddonConnectionState(
@@ -106,6 +128,10 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
         ),
       ) {
     _initializeServer();
+    _presenceTimer = Timer.periodic(
+      _presenceCheckInterval,
+      (_) => _reconcilePresence(),
+    );
   }
 
   Future<void> _initializeServer() async {
@@ -113,11 +139,13 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
       final success = await _addonService.startServer(
         port: state.port,
         onJobReceived: _handleJobReceived,
+        onAddonSeen: _markAddonSeen,
       );
 
       state = state.copyWith(
         isServerRunning: success,
         lastError: success ? null : 'Failed to start server',
+        clearLastError: success,
       );
     } catch (e) {
       state = state.copyWith(isServerRunning: false, lastError: e.toString());
@@ -131,6 +159,22 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
     await _initializeServer();
   }
 
+  /// Flip the badge on the next heartbeat without waiting for the timer.
+  void _markAddonSeen() {
+    if (!state.isConnected) {
+      state = state.copyWith(isConnected: true);
+    }
+  }
+
+  /// Expire the connected flag once the addon has gone quiet past the window.
+  void _reconcilePresence() {
+    if (state.isConnected != addonSeenRecently(_addonService.lastAddonSeenAt)) {
+      state = state.copyWith(
+        isConnected: addonSeenRecently(_addonService.lastAddonSeenAt),
+      );
+    }
+  }
+
   void _handleJobReceived(Map<String, dynamic> jobData) {
     print('Job received from Blender addon: $jobData');
 
@@ -138,7 +182,7 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
     state = state.copyWith(
       isConnected: true,
       lastJobReceivedAt: DateTime.now(),
-      lastError: null,
+      clearLastError: true,
     );
 
     // Add to received jobs list
@@ -505,6 +549,7 @@ class AddonConnectionNotifier extends rp.StateNotifier<AddonConnectionState> {
 
   @override
   void dispose() {
+    _presenceTimer?.cancel();
     _addonService.stopServer();
     super.dispose();
   }

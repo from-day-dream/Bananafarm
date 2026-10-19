@@ -7,23 +7,42 @@ import 'app_paths.dart';
 /// Callback for when a job is received from Blender addon
 typedef JobReceivedCallback = void Function(Map<String, dynamic> jobData);
 
+/// Callback for any sign of life from the Blender addon
+typedef AddonSeenCallback = void Function();
+
 class AddonService {
   late HttpServer _server;
   bool _isRunning = false;
   int _port = 47288;
   JobReceivedCallback? _onJobReceived;
+  AddonSeenCallback? _onAddonSeen;
+  DateTime? _lastAddonSeenAt;
 
   bool get isRunning => _isRunning;
   int get port => _port;
+
+  /// Last time the addon made itself known (heartbeat, temp-root probe or a
+  /// job transfer). Null until the first such request after this server start.
+  DateTime? get lastAddonSeenAt => _lastAddonSeenAt;
+
+  void _markAddonSeen() {
+    _lastAddonSeenAt = DateTime.now();
+    _onAddonSeen?.call();
+  }
 
   /// Start the HTTP server to receive jobs from Blender addon
   Future<bool> startServer({
     int port = 47288,
     JobReceivedCallback? onJobReceived,
+    AddonSeenCallback? onAddonSeen,
   }) async {
     try {
       _port = port;
       _onJobReceived = onJobReceived;
+      _onAddonSeen = onAddonSeen;
+      // A fresh server knows nothing about the addon yet; without this reset a
+      // restart on a new port could keep the old timestamp "fresh" briefly.
+      _lastAddonSeenAt = null;
 
       _server = await HttpServer.bind('localhost', port);
       _isRunning = true;
@@ -45,15 +64,24 @@ class AddonService {
 
           // Route handling
           if (request.method == 'POST' && request.uri.path == '/transfer-job') {
+            _markAddonSeen();
             await _handleTransferJob(request);
           } else if (request.method == 'GET' &&
               request.uri.path == '/temp-root') {
+            _markAddonSeen();
             // The addon asks for this before it writes anything, so the app
             // stays the single source of truth for where temp data lives.
             await Directory(AppPaths.incomingRoot).create(recursive: true);
             request.response.write(jsonEncode({
               'temp_root': AppPaths.incomingRoot,
             }));
+            await request.response.close();
+          } else if (request.method == 'GET' &&
+              request.uri.path == '/addon-ping') {
+            // Presence heartbeat from the addon; nothing to serve, the
+            // timestamp it stamped is the payload.
+            _markAddonSeen();
+            request.response.write(jsonEncode({'status': 'ok'}));
             await request.response.close();
           } else if (request.method == 'GET' && request.uri.path == '/health') {
             request.response.write(jsonEncode({
